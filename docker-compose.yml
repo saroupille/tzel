@@ -1,0 +1,159 @@
+services:
+
+  # ── L1 stack ─────────────────────────────────────────────────────────────────
+
+  octez-node:
+    image: registry.gitlab.com/tezos/tezos/octez-bare:v24.4
+    entrypoint: []
+    command:
+      - octez-node
+      - run
+      - --data-dir=/var/lib/tzel/octez-node
+      - --rpc-addr=0.0.0.0:8732
+      - --net-addr=0.0.0.0:9732
+      - --history-mode=rolling
+    volumes:
+      - octez-node-data:/var/lib/tzel/octez-node
+    ports:
+      - "9732:9732"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "octez-client --endpoint http://localhost:8732 rpc get /version || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  octez-dal-node:
+    image: registry.gitlab.com/tezos/tezos/octez-bare:v24.4
+    entrypoint: []
+    command:
+      - octez-dal-node
+      - run
+      - --data-dir=/var/lib/tzel/octez-dal-node
+      - --endpoint=http://octez-node:8732
+      - --rpc-addr=0.0.0.0:10732
+      - --net-addr=0.0.0.0:11732
+      - --public-addr=${TZEL_DAL_PUBLIC_ADDR}
+      - --operator-profiles=${TZEL_DAL_OPERATOR_PROFILES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}
+      - --fetch-trusted-setup=true
+    volumes:
+      - dal-data:/var/lib/tzel/octez-dal-node
+    ports:
+      - "11732:11732"
+    depends_on:
+      octez-node:
+        condition: service_healthy
+    restart: unless-stopped
+
+  octez-rollup-node:
+    image: registry.gitlab.com/tezos/tezos/octez-bare:v24.4
+    entrypoint: []
+    command:
+      - octez-smart-rollup-node
+      - -d
+      - /var/lib/tzel/octez-client
+      - -E
+      - http://octez-node:8732
+      - run
+      - --data-dir=/var/lib/tzel/octez-rollup-node
+      - --mode=observer
+      - --rollup=${TZEL_ROLLUP_ADDRESS}
+      - --rpc-addr=0.0.0.0
+      - --rpc-port=28944
+      - --dal-node=http://octez-dal-node:10732
+      - --log-kernel-debug
+      - --no-degraded
+    volumes:
+      - rollup-data:/var/lib/tzel/octez-rollup-node
+      - octez-client:/var/lib/tzel/octez-client
+    depends_on:
+      octez-node:
+        condition: service_healthy
+      octez-dal-node:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── TzEL services ────────────────────────────────────────────────────────────
+
+  tzel-operator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.operator
+    command:
+      - tzel-operator
+      - --listen=0.0.0.0:8787
+      - --source-alias=${TZEL_SOURCE_ALIAS}
+      - --state-dir=/var/lib/tzel/operator
+      - --octez-client-bin=/usr/bin/octez-client
+      - --octez-client-dir=/var/lib/tzel/octez-client
+      - --octez-node-endpoint=http://octez-node:8732
+      - --dal-node-endpoint=http://octez-dal-node:10732
+      - --reconcile-interval-secs=${TZEL_OPERATOR_RECONCILE_INTERVAL_SECS:-15}
+    volumes:
+      - operator-state:/var/lib/tzel/operator
+      - octez-client:/var/lib/tzel/octez-client
+    depends_on:
+      octez-rollup-node:
+        condition: service_started
+    restart: unless-stopped
+
+  wallet-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.wallet
+    command:
+      - wallet-server
+      - --wallet=/var/lib/tzel/wallet/wallet.json
+      - --ledger=http://tzel-operator:8787
+      - --port=8081
+    volumes:
+      - wallet-data:/var/lib/tzel/wallet
+    depends_on:
+      - tzel-operator
+    restart: unless-stopped
+
+  proving-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.prover
+    restart: unless-stopped
+
+  tzel-dapp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dapp
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tzel-operator
+      - wallet-server
+      - proving-service
+    restart: unless-stopped
+
+  # ── Optional ─────────────────────────────────────────────────────────────────
+
+  tzel-detect:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.wallet
+    command:
+      - tzel-detect
+      - --listen=0.0.0.0:8789
+      - --rollup-node-url=http://octez-rollup-node:28944
+      - --rollup-address=${TZEL_ROLLUP_ADDRESS}
+      - --operator-url=http://tzel-operator:8787
+    profiles:
+      - detect
+    depends_on:
+      - octez-rollup-node
+      - tzel-operator
+    restart: unless-stopped
+
+volumes:
+  octez-node-data:
+  dal-data:
+  rollup-data:
+  octez-client:
+  operator-state:
+  wallet-data:

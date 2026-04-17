@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+# Build context: root of this repo (tzel/)
+#
+# octez-client is included (required by tzel-operator to inject L1 operations).
+
+FROM registry.gitlab.com/tezos/tezos/octez-bare:v24.4 AS octez
+
+FROM rust:1.85-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tzel
+COPY . .
+RUN cargo build --release --bin tzel-operator
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=octez    /usr/bin/octez-client          /usr/bin/octez-client
+COPY --from=builder  /tzel/target/release/tzel-operator  /usr/local/bin/tzel-operator
+
+ENV TZEL_OPERATOR_LISTEN=0.0.0.0:8787
+
+EXPOSE 8787
+ENTRYPOINT ["tzel-operator"]

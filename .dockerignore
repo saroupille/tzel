@@ -1,0 +1,11 @@
+# Exclude build artifacts from Docker build context
+target/
+apps/prover/target/
+apps/reprover/target/
+.git/
+node_modules/
+web/node_modules/
+.idea/
+.vscode/
+*.swp
+.env

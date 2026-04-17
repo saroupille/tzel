@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# Build context: root of this repo (tzel/)
+#
+# Produces wallet-server (port 8081) and tzel-detect (port 8789) in one image.
+# Select binary via CMD in docker-compose.yml.
+
+FROM rust:1.85-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tzel
+COPY . .
+RUN cargo build --release --bin wallet-server --bin tzel-detect
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /tzel/target/release/wallet-server /usr/local/bin/wallet-server
+COPY --from=builder /tzel/target/release/tzel-detect   /usr/local/bin/tzel-detect
+
+EXPOSE 8081 8789
+
+CMD ["wallet-server"]

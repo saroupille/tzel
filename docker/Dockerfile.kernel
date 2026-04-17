@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+# Build context: root of this repo (tzel/)
+#
+# Stage 1: compile tzel-rollup-kernel to WASM
+# Stage 2: origination image (octez-client + WASM artifact)
+#
+# Usage (one-off per testnet, from tzel-infra/):
+#   make originate
+
+FROM rust:1.85-slim AS kernel-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    wabt \
+    xxd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add wasm32-unknown-unknown
+
+WORKDIR /tzel
+COPY . .
+
+RUN cargo build --release \
+      --target wasm32-unknown-unknown \
+      -p tzel-rollup-kernel \
+    && wasm-strip \
+         target/wasm32-unknown-unknown/release/tzel_rollup_kernel.wasm
+
+# ── Origination runtime ───────────────────────────────────────────────────────
+FROM registry.gitlab.com/tezos/tezos/octez-bare:v24.4
+
+COPY --from=kernel-builder \
+    /tzel/target/wasm32-unknown-unknown/release/tzel_rollup_kernel.wasm \
+    /kernel/tzel_rollup_kernel.wasm
+
+ENTRYPOINT ["octez-client"]
