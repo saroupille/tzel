@@ -107,16 +107,26 @@ services:
       - --wallet=/var/lib/tzel/wallet/wallet.json
       - --ledger=http://tzel-operator:8787
       - --port=8081
+      - --proving-service=http://proving-service:9000
     volumes:
       - wallet-data:/var/lib/tzel/wallet
     depends_on:
       - tzel-operator
+      - proving-service
     restart: unless-stopped
 
   proving-service:
     build:
       context: .
       dockerfile: docker/Dockerfile.prover
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   tzel-dapp:

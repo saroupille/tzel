@@ -19,7 +19,7 @@ WORKDIR /tzel
 COPY . .
 
 WORKDIR /tzel/apps/prover
-RUN cargo build --release --bin reprove
+RUN cargo build --release --bin reprove --bin proving_server
 
 # ── Cairo executables ──────────────────────────────────────────────────────────
 FROM starknet/scarb:2.16.1 AS cairo-builder
@@ -36,10 +36,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=rust-builder  /tzel/apps/prover/target/release/reprove  /usr/local/bin/reprove
-COPY --from=cairo-builder /cairo/target/                             /opt/tzel/cairo/target/
+COPY --from=rust-builder  /tzel/apps/prover/target/release/reprove          /usr/local/bin/reprove
+COPY --from=rust-builder  /tzel/apps/prover/target/release/proving_server   /usr/local/bin/proving-server
+COPY --from=cairo-builder /cairo/target/                                     /opt/tzel/cairo/target/
 
 ENV REPROVE_CAIRO_DIR=/opt/tzel/cairo/target
 
 EXPOSE 9000
-ENTRYPOINT ["reprove"]
+CMD ["proving-server"]
