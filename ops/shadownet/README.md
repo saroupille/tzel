@@ -28,7 +28,7 @@ by the rest of the DAL network. In practice that means:
   - standard prover deployment paths plus preflight for `reprove` and the Cairo executables
 - `../../scripts/install_tzel_binaries.sh`
   - installs `tzel-operator`, `tzel-wallet`, `tzel-detect`, `sp-client`, `octez_kernel_message`,
-    `verified_bridge_fixture_message`, `reprove`, and the Cairo executable JSON files
+    `verified_bridge_fixture_message`, `submit_rollup_config`, `reprove`, and the Cairo executable JSON files
   - installs `rollup-config-admin-{runtime,build}.env` and wraps `octez_kernel_message` so
     config messages stay usable after install
 - `../../scripts/shadownet_operator_preflight.sh`
@@ -52,18 +52,23 @@ by the rest of the DAL network. In practice that means:
 5. Initialize local state and node identity.
    - `sudo ./scripts/init_shadownet_operator_box.sh /etc/tzel/shadownet.env`
    - this also creates `TZEL_OPERATOR_BEARER_TOKEN_FILE` if it does not exist
-6. Import the operator key once.
+6. Export view material for the operator fee address and copy it onto the box.
+   - example:
+     - `/usr/local/bin/tzel-wallet --wallet operator-fee.wallet export-view --out operator-dal-fee.view.json`
+   - place the exported file at `TZEL_OPERATOR_DAL_FEE_VIEW_MATERIAL`
+   - `TZEL_OPERATOR_DAL_FEE_ADDRESS_INDEX` must match the address index used for `dal_fee_address`
+7. Import the operator key once.
    - `sudo -u tzel octez-client -d /var/lib/tzel/octez-client import secret key tzelshadownet <SECRET_KEY>`
-7. Copy the service units.
+8. Copy the service units.
    - `sudo cp ops/shadownet/systemd/*.service /etc/systemd/system/`
-8. Reload and start services.
+9. Reload and start services.
    - `sudo systemctl daemon-reload`
    - `sudo systemctl enable --now octez-node octez-dal-node octez-rollup-node tzel-operator`
    - optionally enable `tzel-detect` after creating a watch wallet and setting `TZEL_DETECT_ENABLE=1`
    - `sudo systemctl enable --now tzel-detect`
-9. Run preflight.
+10. Run preflight.
    - `./scripts/shadownet_operator_preflight.sh /etc/tzel/shadownet.env`
-10. Run a wallet-facing smoke once the rollup is configured.
+11. Run a wallet-facing smoke once the rollup is configured.
    - `TZEL_SMOKE_L1_RECIPIENT=tz1REPLACE_ME ./scripts/shadownet_live_e2e_smoke.sh /etc/tzel/shadownet.env`
 
 ## Expected Local RPCs
@@ -95,6 +100,8 @@ For delegated watch-only scanning, export watch material from a spending wallet:
   --rollup-node-url http://127.0.0.1:28944 \
   --rollup-address "$TZEL_ROLLUP_ADDRESS" \
   --bridge-ticketer "$TZEL_BRIDGE_TICKETER" \
+  --dal-fee 1 \
+  --dal-fee-address /var/lib/tzel/watch/producer-address.json \
   --source-alias "$TZEL_SOURCE_ALIAS"
 ```
 
@@ -118,6 +125,8 @@ the rollup state:
   --rollup-node-url http://127.0.0.1:28944 \
   --rollup-address "$TZEL_ROLLUP_ADDRESS" \
   --bridge-ticketer "$TZEL_BRIDGE_TICKETER" \
+  --dal-fee 1 \
+  --dal-fee-address /var/lib/tzel/watch/producer-address.json \
   --source-alias "$TZEL_SOURCE_ALIAS"
 /usr/local/bin/tzel-wallet --wallet /tmp/tzel-check.wallet check
 ```

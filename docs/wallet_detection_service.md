@@ -48,9 +48,15 @@ tzel-wallet --wallet alice.watch.json profile init-shadownet \
   --rollup-node-url http://127.0.0.1:28946 \
   --rollup-address sr1... \
   --bridge-ticketer KT1... \
+  --dal-fee 1 \
+  --dal-fee-address producer-address.json \
   --source-alias alice \
   --public-account alice
 ```
+
+`public-account` is only the transparent rollup account used after unshield and
+withdraw. Shield deposits use wallet-held secret-bound deposit ids and are not
+part of the watch-only material.
 
 ## Sync Manually
 

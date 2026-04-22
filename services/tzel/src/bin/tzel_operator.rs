@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use ml_kem::KeyExport;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::Write;
@@ -17,17 +18,22 @@ use std::time::Duration;
 use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::SmartRollupAddress};
 use tzel_core::{
-    hash,
+    auth_leaf_hash, commit, decrypt_memo, derive_auth_pub_seed, derive_kem_keys, derive_rcm,
+    detect, hash,
     kernel_wire::{
-        encode_kernel_inbox_message, KernelDalChunkPointer, KernelDalPayloadKind,
-        KernelDalPayloadPointer, KernelInboxMessage,
+        decode_kernel_inbox_message, encode_kernel_inbox_message, kernel_bridge_config_sighash,
+        kernel_verifier_config_sighash, KernelDalChunkPointer, KernelDalPayloadKind,
+        KernelDalPayloadPointer, KernelInboxMessage, KERNEL_BRIDGE_CONFIG_KEY_INDEX,
+        KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
     operator_api::{
         RollupDalChunk, RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus,
         RollupSubmissionTransport, SubmitRollupMessageReq, SubmitRollupMessageResp,
     },
-    F,
+    owner_tag, verify_wots_signature_against_leaf, EncryptedNote, PaymentAddress, F,
 };
+
+const DEFAULT_DIRECT_MAX_MESSAGE_BYTES: usize = 4096;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,7 +47,7 @@ struct Cli {
     source_alias: String,
     #[arg(long, default_value = "operator-state")]
     state_dir: String,
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = DEFAULT_DIRECT_MAX_MESSAGE_BYTES)]
     direct_max_message_bytes: usize,
     #[arg(long)]
     dal_max_chunk_bytes: Option<usize>,
@@ -59,6 +65,12 @@ struct Cli {
     bearer_token: Option<String>,
     #[arg(long)]
     bearer_token_file: Option<String>,
+    #[arg(long)]
+    required_dal_fee: Option<u64>,
+    #[arg(long)]
+    dal_fee_view_material: Option<String>,
+    #[arg(long)]
+    dal_fee_address_index: Option<u32>,
     #[arg(long, default_value_t = 5)]
     reconcile_interval_secs: u64,
 }
@@ -81,8 +93,17 @@ struct OperatorConfig {
     octez_node_endpoint: Option<String>,
     dal_node_endpoint: Option<String>,
     octez_protocol: Option<String>,
+    dal_fee_policy: Option<OperatorDalFeePolicy>,
     id_counter: AtomicU64,
     slot_counter: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct OperatorDalFeePolicy {
+    amount: u64,
+    incoming_seed: F,
+    address_index: u32,
+    address: PaymentAddress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +140,40 @@ enum DalSlotStatusResp {
         kind: String,
         #[allow(dead_code)]
         attestation_lag: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OperatorViewAddressRecord {
+    index: u32,
+    #[serde(with = "tzel_core::hex_f")]
+    d_j: F,
+    #[serde(with = "tzel_core::hex_f")]
+    auth_root: F,
+    #[serde(with = "tzel_core::hex_f")]
+    auth_pub_seed: F,
+    #[serde(with = "tzel_core::hex_f")]
+    nk_tag: F,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum OperatorViewMaterial {
+    View {
+        #[serde(rename = "version")]
+        _version: u16,
+        #[serde(with = "tzel_core::hex_f")]
+        incoming_seed: F,
+        addresses: Vec<OperatorViewAddressRecord>,
+    },
+    Detect {
+        #[serde(rename = "version")]
+        _version: u16,
+        #[serde(rename = "detect_root")]
+        #[serde(with = "tzel_core::hex_f")]
+        _detect_root: F,
+        #[serde(rename = "addr_count")]
+        _addr_count: u32,
     },
 }
 
@@ -163,6 +218,28 @@ async fn run(cli: Cli) -> Result<(), String> {
     if bearer_token.is_empty() {
         return Err("operator bearer token must not be empty".into());
     }
+    let dal_fee_policy = match (
+        cli.required_dal_fee,
+        cli.dal_fee_view_material.as_deref(),
+        cli.dal_fee_address_index,
+    ) {
+        (None, None, None) => None,
+        (Some(amount), Some(material_path), Some(address_index)) => Some(
+            load_dal_fee_policy(amount, material_path, address_index)?,
+        ),
+        _ => {
+            return Err(
+                "specify all of --required-dal-fee, --dal-fee-view-material, and --dal-fee-address-index together"
+                    .into(),
+            )
+        }
+    };
+    if cli.dal_node_endpoint.is_some() && dal_fee_policy.is_none() {
+        return Err(
+            "DAL publication requires --required-dal-fee, --dal-fee-view-material, and --dal-fee-address-index"
+                .into(),
+        );
+    }
     let state_dir = PathBuf::from(&cli.state_dir);
     std::fs::create_dir_all(submissions_dir(&state_dir))
         .map_err(|e| format!("create state dir: {}", e))?;
@@ -179,6 +256,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             octez_node_endpoint: cli.octez_node_endpoint,
             dal_node_endpoint: cli.dal_node_endpoint,
             octez_protocol: cli.octez_protocol,
+            dal_fee_policy,
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
         }),
@@ -232,6 +310,272 @@ fn require_bearer_auth(
         return Err((StatusCode::UNAUTHORIZED, "invalid bearer token".into()));
     }
     Ok(())
+}
+
+fn load_dal_fee_policy(
+    amount: u64,
+    material_path: &str,
+    address_index: u32,
+) -> Result<OperatorDalFeePolicy, String> {
+    if amount == 0 {
+        return Err("required DAL fee must be greater than zero".into());
+    }
+    let body = std::fs::read_to_string(material_path)
+        .map_err(|e| format!("read DAL fee view material {}: {}", material_path, e))?;
+    let material: OperatorViewMaterial = serde_json::from_str(&body)
+        .map_err(|e| format!("parse DAL fee view material {}: {}", material_path, e))?;
+    let (incoming_seed, addresses) = match material {
+        OperatorViewMaterial::View {
+            _version: _,
+            incoming_seed,
+            addresses,
+        } => (incoming_seed, addresses),
+        OperatorViewMaterial::Detect { .. } => {
+            return Err("DAL fee policy requires view material, not detect-only material".into())
+        }
+    };
+    let address = addresses
+        .into_iter()
+        .find(|record| record.index == address_index)
+        .ok_or_else(|| {
+            format!(
+                "DAL fee view material does not contain address index {}",
+                address_index
+            )
+        })?;
+    let (ek_v, _dk_v, ek_d, _dk_d) = derive_kem_keys(&incoming_seed, address_index);
+    Ok(OperatorDalFeePolicy {
+        amount,
+        incoming_seed,
+        address_index,
+        address: PaymentAddress {
+            d_j: address.d_j,
+            auth_root: address.auth_root,
+            auth_pub_seed: address.auth_pub_seed,
+            nk_tag: address.nk_tag,
+            ek_v: ek_v.to_bytes().to_vec(),
+            ek_d: ek_d.to_bytes().to_vec(),
+        },
+    })
+}
+
+fn kernel_message_matches_submission_kind(
+    kind: RollupSubmissionKind,
+    message: &KernelInboxMessage,
+) -> bool {
+    matches!(
+        (kind, message),
+        (
+            RollupSubmissionKind::ConfigureVerifier,
+            KernelInboxMessage::ConfigureVerifier(_)
+        ) | (
+            RollupSubmissionKind::ConfigureBridge,
+            KernelInboxMessage::ConfigureBridge(_)
+        ) | (RollupSubmissionKind::Shield, KernelInboxMessage::Shield(_))
+            | (
+                RollupSubmissionKind::Transfer,
+                KernelInboxMessage::Transfer(_)
+            )
+            | (
+                RollupSubmissionKind::Unshield,
+                KernelInboxMessage::Unshield(_)
+            )
+            | (
+                RollupSubmissionKind::Withdraw,
+                KernelInboxMessage::Withdraw(_)
+            )
+    )
+}
+
+fn submission_kind_requires_dal_fee_policy(kind: RollupSubmissionKind) -> bool {
+    matches!(
+        kind,
+        RollupSubmissionKind::Shield
+            | RollupSubmissionKind::Transfer
+            | RollupSubmissionKind::Unshield
+    )
+}
+
+#[cfg(any(test, debug_assertions))]
+fn dev_config_admin_ask() -> F {
+    hash(b"tzel-dev-rollup-config-admin")
+}
+
+fn parse_runtime_felt_hex(var: &str) -> Result<F, String> {
+    let value = std::env::var(var).map_err(|_| format!("missing required env var: {}", var))?;
+    let bytes = hex::decode(&value).map_err(|e| format!("{} is not valid hex: {}", var, e))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "{} must decode to exactly 32 bytes, got {}",
+            var,
+            bytes.len()
+        ));
+    }
+    let mut felt = [0u8; 32];
+    felt.copy_from_slice(&bytes);
+    Ok(felt)
+}
+
+fn operator_config_admin_pub_seed() -> Result<F, String> {
+    match std::env::var("TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX") {
+        Ok(_) => parse_runtime_felt_hex("TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX"),
+        Err(_) => {
+            #[cfg(any(test, debug_assertions))]
+            {
+                return Ok(derive_auth_pub_seed(&dev_config_admin_ask()));
+            }
+            #[allow(unreachable_code)]
+            Err("operator missing TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX".into())
+        }
+    }
+}
+
+fn operator_verifier_config_leaf() -> Result<F, String> {
+    match std::env::var("TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX") {
+        Ok(_) => parse_runtime_felt_hex("TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX"),
+        Err(_) => {
+            #[cfg(any(test, debug_assertions))]
+            {
+                return Ok(auth_leaf_hash(
+                    &dev_config_admin_ask(),
+                    KERNEL_VERIFIER_CONFIG_KEY_INDEX,
+                ));
+            }
+            #[allow(unreachable_code)]
+            Err("operator missing TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX".into())
+        }
+    }
+}
+
+fn operator_bridge_config_leaf() -> Result<F, String> {
+    match std::env::var("TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX") {
+        Ok(_) => parse_runtime_felt_hex("TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX"),
+        Err(_) => {
+            #[cfg(any(test, debug_assertions))]
+            {
+                return Ok(auth_leaf_hash(
+                    &dev_config_admin_ask(),
+                    KERNEL_BRIDGE_CONFIG_KEY_INDEX,
+                ));
+            }
+            #[allow(unreachable_code)]
+            Err("operator missing TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX".into())
+        }
+    }
+}
+
+fn authenticate_config_submission(message: &KernelInboxMessage) -> Result<(), String> {
+    match message {
+        KernelInboxMessage::ConfigureVerifier(config) => {
+            let pub_seed = operator_config_admin_pub_seed()?;
+            let expected_leaf = operator_verifier_config_leaf()?;
+            let sighash = kernel_verifier_config_sighash(&config.config)?;
+            verify_wots_signature_against_leaf(
+                &sighash,
+                &pub_seed,
+                KERNEL_VERIFIER_CONFIG_KEY_INDEX,
+                &config.signature,
+                &expected_leaf,
+            )
+        }
+        KernelInboxMessage::ConfigureBridge(config) => {
+            let pub_seed = operator_config_admin_pub_seed()?;
+            let expected_leaf = operator_bridge_config_leaf()?;
+            let sighash = kernel_bridge_config_sighash(&config.config)?;
+            verify_wots_signature_against_leaf(
+                &sighash,
+                &pub_seed,
+                KERNEL_BRIDGE_CONFIG_KEY_INDEX,
+                &config.signature,
+                &expected_leaf,
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+fn decode_and_validate_submission_payload(
+    kind: RollupSubmissionKind,
+    payload: &[u8],
+) -> Result<KernelInboxMessage, String> {
+    let message = decode_kernel_inbox_message(payload)
+        .map_err(|e| format!("decode kernel payload: {}", e))?;
+    if !kernel_message_matches_submission_kind(kind, &message) {
+        return Err("submission kind does not match kernel payload".into());
+    }
+    authenticate_config_submission(&message)?;
+    Ok(message)
+}
+
+fn validate_fee_note_against_policy(
+    policy: &OperatorDalFeePolicy,
+    commitment: &F,
+    enc: &EncryptedNote,
+    claimed_fee: u64,
+) -> Result<(), String> {
+    if claimed_fee != policy.amount {
+        return Err(format!(
+            "DAL fee mismatch: expected {}, got {}",
+            policy.amount, claimed_fee
+        ));
+    }
+    let (_ek_v, dk_v, _ek_d, dk_d) = derive_kem_keys(&policy.incoming_seed, policy.address_index);
+    if !detect(enc, &dk_d) {
+        return Err("DAL fee note is not detectable by the configured operator fee address".into());
+    }
+    let (value, rseed, _memo) = decrypt_memo(enc, &dk_v).ok_or_else(|| {
+        "DAL fee note is not decryptable by the configured operator fee address".to_string()
+    })?;
+    if value != policy.amount {
+        return Err(format!(
+            "DAL fee note decrypts to {}, expected {}",
+            value, policy.amount
+        ));
+    }
+    let rcm = derive_rcm(&rseed);
+    let otag = owner_tag(
+        &policy.address.auth_root,
+        &policy.address.auth_pub_seed,
+        &policy.address.nk_tag,
+    );
+    let expected = commit(&policy.address.d_j, value, &rcm, &otag);
+    if &expected != commitment {
+        return Err(
+            "DAL fee note commitment does not match the configured operator fee address".into(),
+        );
+    }
+    Ok(())
+}
+
+fn enforce_dal_fee_policy(
+    config: &OperatorConfig,
+    message: &KernelInboxMessage,
+) -> Result<(), String> {
+    let policy = config
+        .dal_fee_policy
+        .as_ref()
+        .ok_or_else(|| "operator is missing DAL fee policy".to_string())?;
+    match message {
+        KernelInboxMessage::Shield(req) => {
+            let enc = req
+                .producer_enc
+                .as_ref()
+                .ok_or_else(|| "shield DAL fee note is missing producer_enc".to_string())?;
+            validate_fee_note_against_policy(policy, &req.producer_cm, enc, req.producer_fee)
+        }
+        KernelInboxMessage::Transfer(req) => {
+            validate_fee_note_against_policy(policy, &req.cm_3, &req.enc_3, policy.amount)
+        }
+        KernelInboxMessage::Unshield(req) => {
+            validate_fee_note_against_policy(policy, &req.cm_fee, &req.enc_fee, policy.amount)
+        }
+        KernelInboxMessage::ConfigureVerifier(_)
+        | KernelInboxMessage::ConfigureBridge(_)
+        | KernelInboxMessage::Withdraw(_)
+        | KernelInboxMessage::DalPointer(_) => {
+            Err("operator only publishes shield, transfer, and unshield payloads to DAL".into())
+        }
+    }
 }
 
 async fn reconcile_loop(
@@ -449,6 +793,13 @@ fn process_submission(
         return Ok(stored.submission);
     }
 
+    let message = decode_and_validate_submission_payload(req.kind, &req.payload)?;
+    if matches!(req.kind, RollupSubmissionKind::Withdraw) {
+        return Err("withdraw submissions do not support DAL publication".into());
+    }
+    if submission_kind_requires_dal_fee_policy(req.kind) {
+        enforce_dal_fee_policy(config, &message)?;
+    }
     stored.submission.detail = Some("Accepted for DAL publication".into());
     persist_submission(config, &stored)?;
 
@@ -933,6 +1284,8 @@ fn dal_pointer_from_submission(
     submission: &RollupSubmission,
 ) -> Result<KernelDalPayloadPointer, String> {
     let kind = match submission.kind {
+        RollupSubmissionKind::ConfigureVerifier => KernelDalPayloadKind::ConfigureVerifier,
+        RollupSubmissionKind::ConfigureBridge => KernelDalPayloadKind::ConfigureBridge,
         RollupSubmissionKind::Shield => KernelDalPayloadKind::Shield,
         RollupSubmissionKind::Transfer => KernelDalPayloadKind::Transfer,
         RollupSubmissionKind::Unshield => KernelDalPayloadKind::Unshield,
@@ -1134,6 +1487,11 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Read;
     use std::net::TcpListener;
+    use tzel_core::kernel_wire::{
+        sign_kernel_bridge_config, sign_kernel_verifier_config, KernelBridgeConfig,
+        KernelVerifierConfig,
+    };
+    use tzel_core::ProgramHashes;
 
     fn config_with_client(script: &Path) -> OperatorConfig {
         let state_dir = std::env::temp_dir().join(format!(
@@ -1156,9 +1514,191 @@ mod tests {
             octez_node_endpoint: Some("http://octez-node.invalid".into()),
             dal_node_endpoint: None,
             octez_protocol: None,
+            dal_fee_policy: None,
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
         }
+    }
+
+    fn sample_fee_policy() -> OperatorDalFeePolicy {
+        let incoming_seed = [0x41; 32];
+        let address_index = 0;
+        let (ek_v, _dk_v, ek_d, _dk_d) = derive_kem_keys(&incoming_seed, address_index);
+        OperatorDalFeePolicy {
+            amount: 7,
+            incoming_seed,
+            address_index,
+            address: PaymentAddress {
+                d_j: [0x11; 32],
+                auth_root: [0x12; 32],
+                auth_pub_seed: [0x13; 32],
+                nk_tag: [0x14; 32],
+                ek_v: ek_v.to_bytes().to_vec(),
+                ek_d: ek_d.to_bytes().to_vec(),
+            },
+        }
+    }
+
+    fn sample_fee_note(policy: &OperatorDalFeePolicy, rseed: F) -> (EncryptedNote, F) {
+        let ek_v = tzel_core::Ek::new(
+            policy
+                .address
+                .ek_v
+                .as_slice()
+                .try_into()
+                .expect("fixed ek_v length"),
+        )
+        .expect("valid ek_v");
+        let ek_d = tzel_core::Ek::new(
+            policy
+                .address
+                .ek_d
+                .as_slice()
+                .try_into()
+                .expect("fixed ek_d length"),
+        )
+        .expect("valid ek_d");
+        let enc = tzel_core::encrypt_note_deterministic(
+            policy.amount,
+            &rseed,
+            Some(b"dal"),
+            &ek_v,
+            &ek_d,
+            &[0x21; 32],
+            &[0x22; 32],
+        );
+        let rcm = derive_rcm(&rseed);
+        let otag = owner_tag(
+            &policy.address.auth_root,
+            &policy.address.auth_pub_seed,
+            &policy.address.nk_tag,
+        );
+        let cm = commit(&policy.address.d_j, policy.amount, &rcm, &otag);
+        (enc, cm)
+    }
+
+    fn sample_shield_payload_with_producer_note(
+        producer_fee: u64,
+        producer_cm: F,
+        producer_enc: EncryptedNote,
+    ) -> Vec<u8> {
+        let policy = sample_fee_policy();
+        encode_kernel_inbox_message(&KernelInboxMessage::Shield(
+            tzel_core::kernel_wire::KernelShieldReq {
+                deposit_id: tzel_core::deposit_id_from_label("alice"),
+                fee: 100_000,
+                v: 25,
+                producer_fee,
+                address: policy.address,
+                memo: None,
+                proof: tzel_core::kernel_wire::KernelStarkProof {
+                    proof_bytes: vec![],
+                    output_preimage: vec![],
+                    verify_meta: vec![],
+                },
+                client_cm: [0u8; 32],
+                client_enc: None,
+                producer_cm,
+                producer_enc: Some(producer_enc),
+            },
+        ))
+        .expect("shield payload should encode")
+    }
+
+    fn sample_config_admin_ask() -> F {
+        hash(b"tzel-dev-rollup-config-admin")
+    }
+
+    fn sample_configure_bridge_payload() -> Vec<u8> {
+        encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(
+            sign_kernel_bridge_config(
+                &sample_config_admin_ask(),
+                KernelBridgeConfig {
+                    ticketer: "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc".into(),
+                },
+            )
+            .unwrap(),
+        ))
+        .unwrap()
+    }
+
+    fn sample_configure_verifier_payload() -> Vec<u8> {
+        encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(
+            sign_kernel_verifier_config(
+                &sample_config_admin_ask(),
+                KernelVerifierConfig {
+                    auth_domain: [0x21; 32],
+                    verified_program_hashes: ProgramHashes {
+                        shield: [0x22; 32],
+                        transfer: [0x23; 32],
+                        unshield: [0x24; 32],
+                    },
+                },
+            )
+            .unwrap(),
+        ))
+        .unwrap()
+    }
+
+    fn sample_invalid_configure_bridge_payload() -> Vec<u8> {
+        let mut message = decode_kernel_inbox_message(&sample_configure_bridge_payload()).unwrap();
+        let KernelInboxMessage::ConfigureBridge(config) = &mut message else {
+            panic!("expected configure-bridge payload")
+        };
+        config.signature[0][0] ^= 0xff;
+        encode_kernel_inbox_message(&message).unwrap()
+    }
+
+    fn sample_withdraw_payload() -> Vec<u8> {
+        encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(
+            tzel_core::kernel_wire::KernelWithdrawReq {
+                sender: "alice".into(),
+                recipient: "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".into(),
+                amount: 1,
+            },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn direct_l1_withdraw_message_fits_protocol_limit() {
+        let framed = encode_targeted_rollup_message(
+            "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP",
+            &sample_withdraw_payload(),
+        )
+        .unwrap();
+        assert!(
+            framed.len() <= DEFAULT_DIRECT_MAX_MESSAGE_BYTES,
+            "framed direct message is {} bytes, above {}",
+            framed.len(),
+            DEFAULT_DIRECT_MAX_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn signed_config_messages_exceed_protocol_l1_limit() {
+        let bridge = encode_targeted_rollup_message(
+            "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP",
+            &sample_configure_bridge_payload(),
+        )
+        .unwrap();
+        let verifier = encode_targeted_rollup_message(
+            "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP",
+            &sample_configure_verifier_payload(),
+        )
+        .unwrap();
+        assert!(
+            bridge.len() > DEFAULT_DIRECT_MAX_MESSAGE_BYTES,
+            "configure-bridge unexpectedly fits direct L1 limit: {} <= {}",
+            bridge.len(),
+            DEFAULT_DIRECT_MAX_MESSAGE_BYTES
+        );
+        assert!(
+            verifier.len() > DEFAULT_DIRECT_MAX_MESSAGE_BYTES,
+            "configure-verifier unexpectedly fits direct L1 limit: {} <= {}",
+            verifier.len(),
+            DEFAULT_DIRECT_MAX_MESSAGE_BYTES
+        );
     }
 
     #[test]
@@ -1317,6 +1857,334 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("DAL node endpoint is not configured"));
+    }
+
+    #[test]
+    fn oversized_dal_submission_rejects_fee_note_for_wrong_owner() {
+        let script_dir = make_client_script("#!/bin/sh\necho 'should not publish'\n");
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        config.dal_node_endpoint = Some("http://dal.invalid".into());
+        config.dal_fee_policy = Some(sample_fee_policy());
+
+        let wrong_incoming_seed = [0x51; 32];
+        let (wrong_ek_v, _wrong_dk_v, wrong_ek_d, _wrong_dk_d) =
+            derive_kem_keys(&wrong_incoming_seed, 0);
+        let wrong_policy = OperatorDalFeePolicy {
+            amount: 7,
+            incoming_seed: wrong_incoming_seed,
+            address_index: 0,
+            address: PaymentAddress {
+                d_j: [0x61; 32],
+                auth_root: [0x62; 32],
+                auth_pub_seed: [0x63; 32],
+                nk_tag: [0x64; 32],
+                ek_v: wrong_ek_v.to_bytes().to_vec(),
+                ek_d: wrong_ek_d.to_bytes().to_vec(),
+            },
+        };
+        let (wrong_enc, wrong_cm) = sample_fee_note(&wrong_policy, [0x71; 32]);
+
+        let err = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::Shield,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: sample_shield_payload_with_producer_note(
+                    wrong_policy.amount,
+                    wrong_cm,
+                    wrong_enc,
+                ),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("configured operator fee address"));
+    }
+
+    #[test]
+    fn oversized_dal_submission_accepts_matching_fee_note() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooDalFeeHash123456789ABCDEFG'\necho 'Operation found in block BLDalFeeHash123456789ABCDEFG'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        let policy = sample_fee_policy();
+        config.dal_fee_policy = Some(policy.clone());
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1dalfee\",\"commitment_proof\":\"proof-dalfee\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLDalFeeHash123456789ABCDEFG/header".into(),
+                (200, "{\"level\":123}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let (enc, cm) = sample_fee_note(&policy, [0x72; 32]);
+        let submission = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::Shield,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: sample_shield_payload_with_producer_note(policy.amount, cm, enc),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(submission.transport, RollupSubmissionTransport::Dal);
+        assert_eq!(
+            submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(submission.dal_chunks.len(), 1);
+    }
+
+    #[test]
+    fn oversized_configure_bridge_submission_uses_dal_without_fee_policy() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooCfgBridgeHash123456789ABCDEFG'\necho 'Operation found in block BLCfgBridgeHash123456789ABCDEFG'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        config.dal_fee_policy = Some(sample_fee_policy());
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1cfgbridge\",\"commitment_proof\":\"proof-cfgbridge\"}"
+                        .into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLCfgBridgeHash123456789ABCDEFG/header".into(),
+                (200, "{\"level\":123}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::ConfigureBridge,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: sample_configure_bridge_payload(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(submission.transport, RollupSubmissionTransport::Dal);
+        assert_eq!(
+            submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(submission.dal_chunks.len(), 1);
+    }
+
+    #[test]
+    fn oversized_configure_submission_rejects_kind_mismatch_before_publish() {
+        let script_dir = make_client_script("#!/bin/sh\necho 'should not publish'\n");
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        config.dal_node_endpoint = Some("http://dal.invalid".into());
+
+        let err = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::ConfigureVerifier,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: sample_configure_bridge_payload(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("submission kind does not match kernel payload"));
+    }
+
+    #[test]
+    fn oversized_configure_verifier_submission_uses_dal_without_fee_policy() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooCfgVerifierHash123456789ABCD'\necho 'Operation found in block BLCfgVerifierHash123456789ABCD'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        config.dal_fee_policy = Some(sample_fee_policy());
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1cfgverifier\",\"commitment_proof\":\"proof-cfgverifier\"}"
+                        .into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLCfgVerifierHash123456789ABCD/header".into(),
+                (200, "{\"level\":123}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::ConfigureVerifier,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: sample_configure_verifier_payload(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(submission.transport, RollupSubmissionTransport::Dal);
+        assert_eq!(
+            submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(submission.dal_chunks.len(), 1);
+    }
+
+    #[test]
+    fn oversized_configure_submission_rejects_malformed_payload_before_publish() {
+        let script_dir = make_client_script("#!/bin/sh\necho 'should not publish'\n");
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        config.dal_node_endpoint = Some("http://dal.invalid".into());
+
+        let err = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::ConfigureBridge,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: vec![0xde, 0xad, 0xbe, 0xef, 0x01],
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("decode kernel payload"));
+    }
+
+    #[test]
+    fn oversized_configure_submission_rejects_invalid_signature_before_publish() {
+        let script_dir = make_client_script("#!/bin/sh\necho 'should not publish'\n");
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        config.dal_node_endpoint = Some("http://dal.invalid".into());
+
+        let err = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::ConfigureBridge,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: sample_invalid_configure_bridge_payload(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("configuration signature verification failed"));
+    }
+
+    #[test]
+    fn oversized_withdraw_submission_is_rejected_before_dal_publication() {
+        let script_dir = make_client_script("#!/bin/sh\necho 'should not publish'\n");
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        config.dal_node_endpoint = Some("http://dal.invalid".into());
+
+        let err = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::Withdraw,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: sample_withdraw_payload(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("withdraw submissions do not support DAL publication"));
+    }
+
+    #[test]
+    fn config_submission_routes_to_dal_at_real_l1_limit() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooCfgRealLimitHash123456789AB'\necho 'Operation found in block BLCfgRealLimitHash123456789AB'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = DEFAULT_DIRECT_MAX_MESSAGE_BYTES;
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1cfgreallimit\",\"commitment_proof\":\"proof-cfgreallimit\"}"
+                        .into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLCfgRealLimitHash123456789AB/header".into(),
+                (200, "{\"level\":123}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let payload = sample_configure_bridge_payload();
+        let targeted =
+            encode_targeted_rollup_message("sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP", &payload)
+                .unwrap();
+        assert!(targeted.len() > config.direct_max_message_bytes);
+
+        let submission = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::ConfigureBridge,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(submission.transport, RollupSubmissionTransport::Dal);
+        assert_eq!(
+            submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
     }
 
     #[test]
@@ -2078,13 +2946,13 @@ mod tests {
         );
         let mut config = config_with_client(&script_dir.path().join("octez-client"));
         config.direct_max_message_bytes = 1;
-        config.dal_max_chunk_bytes = Some(3);
+        config.dal_max_chunk_bytes = Some(1024);
         let endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/protocol_parameters".into(),
                 (
                     200,
-                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
                 ),
             ),
             (
@@ -2102,6 +2970,27 @@ mod tests {
                 ),
             ),
             (
+                "/slots?slot_index=2&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1ccc\",\"commitment_proof\":\"proof-c\"}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=3&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1ddd\",\"commitment_proof\":\"proof-d\"}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=4&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1eee\",\"commitment_proof\":\"proof-e\"}".into(),
+                ),
+            ),
+            (
                 "/chains/main/blocks/BLChunkHash123456789ABCDEFG/header".into(),
                 (200, "{\"level\":123}".into()),
             ),
@@ -2110,15 +2999,18 @@ mod tests {
         config.octez_node_endpoint = Some(endpoint);
 
         let req = SubmitRollupMessageReq {
-            kind: RollupSubmissionKind::Shield,
+            kind: RollupSubmissionKind::ConfigureBridge,
             rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
-            payload: vec![1, 2, 3, 4, 5],
+            payload: sample_configure_bridge_payload(),
         };
         let submission = process_submission(&config, req).unwrap();
         assert_eq!(submission.transport, RollupSubmissionTransport::Dal);
-        assert_eq!(submission.dal_chunks.len(), 2);
-        assert_eq!(submission.dal_chunks[0].payload_len, 3);
-        assert_eq!(submission.dal_chunks[1].payload_len, 2);
+        assert!(submission.dal_chunks.len() > 1);
+        assert_eq!(submission.dal_chunks[0].payload_len, 1024);
+        assert!(submission
+            .dal_chunks
+            .iter()
+            .all(|chunk| chunk.payload_len <= 1024));
     }
 
     #[test]
@@ -2145,7 +3037,7 @@ mod tests {
                 "/protocol_parameters".into(),
                 (
                     200,
-                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
                 ),
             ),
             (
@@ -2171,9 +3063,9 @@ mod tests {
         config.octez_node_endpoint = Some(endpoint);
 
         let req = SubmitRollupMessageReq {
-            kind: RollupSubmissionKind::Shield,
+            kind: RollupSubmissionKind::ConfigureBridge,
             rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
-            payload: vec![1, 2],
+            payload: sample_configure_bridge_payload(),
         };
         let submission = process_submission(&config, req).unwrap();
         assert_eq!(submission.dal_chunks.len(), 1);

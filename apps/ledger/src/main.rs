@@ -86,8 +86,8 @@ async fn shield_handler(
     let mut ledger = st.ledger.lock().unwrap();
     let resp = ledger.shield(&req).map_err(err)?;
     eprintln!(
-        "[shield] {} deposited {} -> cm={} idx={}",
-        req.sender,
+        "[shield] deposit {} shielded {} -> cm={} idx={}",
+        deposit_balance_key(&req.deposit_id),
         req.v,
         short(&resp.cm),
         resp.index
@@ -202,6 +202,7 @@ async fn config_handler(State(st): State<AppState>) -> Json<ConfigResp> {
     let ledger = st.ledger.lock().unwrap();
     Json(ConfigResp {
         auth_domain: ledger.auth_domain,
+        required_tx_fee: MIN_TX_FEE,
     })
 }
 
@@ -275,6 +276,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tzel_services::MIN_TX_FEE;
 
     fn test_state(auth_domain: F) -> AppState {
         Arc::new(LedgerState {
@@ -375,6 +377,7 @@ mod tests {
 
         let Json(config) = config_handler(State(st.clone())).await;
         assert_eq!(config.auth_domain, auth_domain);
+        assert_eq!(config.required_tx_fee, MIN_TX_FEE);
 
         let Json(tree) = tree_handler(State(st.clone())).await;
         assert_eq!(tree.size, 2);
@@ -479,13 +482,17 @@ mod tests {
         let err = shield_handler(
             State(st),
             Json(ShieldReq {
-                sender: "alice".into(),
+                deposit_id: deposit_id_from_label("alice"),
                 v: 5,
+                fee: MIN_TX_FEE,
+                producer_fee: 1,
                 address: dummy_payment_address(1),
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm: ZERO,
                 client_enc: None,
+                producer_cm: u64_to_felt(2),
+                producer_enc: Some(dummy_note(6)),
             }),
         )
         .await
@@ -502,10 +509,13 @@ mod tests {
             Json(TransferReq {
                 root: ZERO,
                 nullifiers: vec![u64_to_felt(1)],
+                fee: MIN_TX_FEE,
                 cm_1: u64_to_felt(2),
                 cm_2: u64_to_felt(3),
+                cm_3: u64_to_felt(4),
                 enc_1: dummy_note(7),
                 enc_2: dummy_note(8),
+                enc_3: dummy_note(9),
                 proof: Proof::TrustMeBro,
             }),
         )
@@ -524,9 +534,12 @@ mod tests {
                 root: ZERO,
                 nullifiers: vec![u64_to_felt(1)],
                 v_pub: 7,
+                fee: MIN_TX_FEE,
                 recipient: "bob".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_fee: u64_to_felt(2),
+                enc_fee: dummy_note(8),
                 proof: Proof::TrustMeBro,
             }),
         )

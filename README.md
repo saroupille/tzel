@@ -16,14 +16,16 @@ Privacy on blockchains today relies on elliptic curve cryptography that quantum 
 - **Fuzzy message detection.** ML-KEM-based detection keys let a lightweight indexer flag likely-incoming transactions without being able to read them.
 - **Diversified addresses.** Generate unlimited unlinkable addresses from a single master key.
 - **1 KB encrypted memos.** End-to-end encrypted with ML-KEM-768 + ChaCha20-Poly1305.
-- **Flexible N->2 transfers.** Consolidate up to 16 notes in a single proof. No dummy notes needed.
+- **Flexible N->3 transfers.** Spend up to 7 notes in a single proof and produce recipient, change, and DAL-producer fee notes without dummy notes.
 
 ### How it works
 
 A UTXO-based private transaction system where:
-- **Deposits** (shield) move public tokens into private notes
-- **Transfers** spend 1-16 private notes and create 2 new ones
-- **Withdrawals** (unshield) destroy private notes and release value publicly
+- **Deposits** credit a namespaced secret-bound rollup deposit key; `shield` proves knowledge of the underlying deposit secret and moves that value into private notes
+- **Transfers** spend 1-7 private notes and create recipient, change, and DAL-producer fee notes
+- **Withdrawals** (unshield) destroy private notes, release value publicly, and create a DAL-producer fee note plus optional change
+- **Every shield / transfer / unshield burns at least 100000 mutez (0.1 tez)**, with a simple per-level stepped fee under congestion in the current rollup deployment
+- **Every shield / transfer / unshield also creates a separate private DAL-producer fee note**
 - Every spend is proven with a **zero-knowledge STARK** that verifies the **WOTS+ signature inside the circuit** — the proof itself proves spend authorization
 
 ## Quick start
@@ -39,11 +41,13 @@ cd cairo && scarb build && cd ..
 target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
 
 # Run the developer/test wallet harness
-target/release/sp-client keygen
-target/release/sp-client fund -l http://localhost:8080 --addr alice --amount 1000
-target/release/sp-client shield -l http://localhost:8080 --sender alice --amount 1000
-target/release/sp-client scan -l http://localhost:8080
-target/release/sp-client balance
+target/release/sp-client -w alice.json keygen
+target/release/sp-client -w producer.json keygen
+target/release/sp-client -w producer.json address | sed -n '2,$p' > producer-address.json
+target/release/sp-client -w alice.json fund -l http://localhost:8080 --addr alice --amount 300002
+target/release/sp-client -w alice.json shield -l http://localhost:8080 --sender alice --amount 200001 --dal-fee 1 --dal-fee-address producer-address.json
+target/release/sp-client -w alice.json scan -l http://localhost:8080
+target/release/sp-client -w alice.json balance
 
 # Run the STARK proofs (requires ~13 GB RAM)
 ./apps/prover/bench.sh
@@ -60,7 +64,7 @@ For deployment-oriented installs with standard paths instead of a workspace chec
 
 > **WARNING:** The ledger refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
-> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
+> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. For local shield testing, `sp-client fund --addr alice` and `sp-client shield --sender alice` deterministically derive a secret-bound deposit id from the label `alice`. The public-balance layer is not a network-authenticated account service and should not be exposed as a real public endpoint.
 >
 > **DEVELOPER WALLET NOTE:** `sp-client` is a developer/reference CLI used for local testing, demos, and integration flows. It persists plaintext secrets and wallet state in local JSON files and is not intended to be a hardened end-user wallet.
 

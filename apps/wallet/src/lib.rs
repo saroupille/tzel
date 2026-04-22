@@ -471,6 +471,8 @@ struct WalletFile {
     wots_key_indices: std::collections::HashMap<u32, u32>,
     #[serde(default)]
     pending_spends: Vec<PendingSpend>,
+    #[serde(default)]
+    pending_deposits: Vec<PendingDeposit>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -487,6 +489,17 @@ struct PendingSpend {
     #[serde(with = "hex_f_vec")]
     nullifiers: Vec<F>,
     description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingDeposit {
+    #[serde(with = "hex_f")]
+    deposit_id: F,
+    #[serde(with = "hex_f")]
+    secret: F,
+    amount: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_hash: Option<String>,
 }
@@ -1409,6 +1422,8 @@ struct WalletNetworkProfile {
     rollup_node_url: String,
     rollup_address: String,
     bridge_ticketer: String,
+    dal_fee: u64,
+    dal_fee_address: PaymentAddress,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operator_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1443,6 +1458,8 @@ fn shadownet_profile(
     rollup_node_url: String,
     rollup_address: String,
     bridge_ticketer: String,
+    dal_fee: u64,
+    dal_fee_address: PaymentAddress,
     operator_url: Option<String>,
     operator_bearer_token: Option<String>,
     source_alias: String,
@@ -1458,6 +1475,8 @@ fn shadownet_profile(
         rollup_node_url,
         rollup_address,
         bridge_ticketer,
+        dal_fee,
+        dal_fee_address,
         operator_url,
         operator_bearer_token,
         public_account: public_account.unwrap_or_else(|| source_alias.clone()),
@@ -1476,6 +1495,9 @@ fn load_network_profile(path: &Path) -> Result<WalletNetworkProfile, String> {
 }
 
 fn validate_network_profile(profile: &WalletNetworkProfile) -> Result<(), String> {
+    if profile.dal_fee == 0 {
+        return Err("dal_fee must be greater than zero".into());
+    }
     let has_operator_url = profile.operator_url.is_some();
     let has_operator_token = profile
         .operator_bearer_token
@@ -1523,7 +1545,7 @@ fn load_required_network_profile(wallet_path: &str) -> Result<WalletNetworkProfi
     let profile_path = default_network_profile_path(wallet_path);
     let profile = load_network_profile(&profile_path).map_err(|e| {
         format!(
-            "network profile is not configured: {}. Run `tzel-wallet profile init-shadownet --rollup-node-url ... --rollup-address ... --bridge-ticketer ... --source-alias ...`",
+            "network profile is not configured: {}. Run `tzel-wallet profile init-shadownet --rollup-node-url ... --rollup-address ... --bridge-ticketer ... --dal-fee ... --dal-fee-address ... --source-alias ...`",
             e
         )
     })?;
@@ -1538,6 +1560,9 @@ fn load_required_network_profile(wallet_path: &str) -> Result<WalletNetworkProfi
 }
 
 const DURABLE_AUTH_DOMAIN: &str = "/tzel/v1/state/auth_domain";
+const DURABLE_LAST_INPUT_LEVEL: &str = "/tzel/v1/state/last_input_level";
+const DURABLE_PRIVATE_TX_FEE_LEVEL: &str = "/tzel/v1/state/fees/private_tx_level";
+const DURABLE_PRIVATE_TX_COUNT_IN_LEVEL: &str = "/tzel/v1/state/fees/private_tx_count_in_level";
 const DURABLE_TREE_SIZE: &str = "/tzel/v1/state/tree/size";
 const DURABLE_TREE_ROOT: &str = "/tzel/v1/state/tree/root";
 const DURABLE_NOTE_PREFIX: &str = "/tzel/v1/state/notes/";
@@ -1562,6 +1587,7 @@ struct RollupSubmissionReceipt {
 #[derive(Clone)]
 struct RollupStateSnapshot {
     auth_domain: F,
+    required_tx_fee: u64,
     tree: MerkleTree,
     notes: Vec<NoteMemo>,
 }
@@ -1589,18 +1615,20 @@ impl<'a> RollupRpc<'a> {
         Self { profile }
     }
 
-    fn durable_value_url(&self, key: &str) -> String {
+    fn block_durable_value_url(&self, block_ref: &str, key: &str) -> String {
         format!(
-            "{}/global/block/head/durable/wasm_2_0_0/value?key={}",
+            "{}/global/block/{}/durable/wasm_2_0_0/value?key={}",
             self.profile.rollup_node_url.trim_end_matches('/'),
+            block_ref,
             key
         )
     }
 
-    fn durable_length_url(&self, key: &str) -> String {
+    fn block_durable_length_url(&self, block_ref: &str, key: &str) -> String {
         format!(
-            "{}/global/block/head/durable/wasm_2_0_0/length?key={}",
+            "{}/global/block/{}/durable/wasm_2_0_0/length?key={}",
             self.profile.rollup_node_url.trim_end_matches('/'),
+            block_ref,
             key
         )
     }
@@ -1612,14 +1640,30 @@ impl<'a> RollupRpc<'a> {
         )
     }
 
-    fn read_durable_text(&self, key: &str) -> Result<String, String> {
-        let url = self.durable_value_url(key);
+    fn block_level_url(&self, block_ref: &str) -> String {
+        format!(
+            "{}/global/block/{}/level",
+            self.profile.rollup_node_url.trim_end_matches('/'),
+            block_ref
+        )
+    }
+
+    fn read_durable_text_at_block(&self, block_ref: &str, key: &str) -> Result<String, String> {
+        let url = self.block_durable_value_url(block_ref, key);
         get_text(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))
     }
 
-    fn read_durable_length(&self, key: &str) -> Result<Option<usize>, String> {
-        let url = self.durable_length_url(key);
+    fn read_durable_length_at_block(
+        &self,
+        block_ref: &str,
+        key: &str,
+    ) -> Result<Option<usize>, String> {
+        let url = self.block_durable_length_url(block_ref, key);
         let raw = get_text(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))?;
+        Self::parse_durable_length(key, &raw)
+    }
+
+    fn parse_durable_length(key: &str, raw: &str) -> Result<Option<usize>, String> {
         let value: Option<serde_json::Value> =
             serde_json::from_str(&raw).map_err(|e| format!("parse durable length: {}", e))?;
         match value {
@@ -1647,15 +1691,147 @@ impl<'a> RollupRpc<'a> {
         }
     }
 
-    fn read_durable_bytes(&self, key: &str) -> Result<Vec<u8>, String> {
-        let raw = self.read_durable_text(key)?;
+    fn read_durable_bytes_at_block(&self, block_ref: &str, key: &str) -> Result<Vec<u8>, String> {
+        let raw = self.read_durable_text_at_block(block_ref, key)?;
         parse_rollup_rpc_bytes(&raw).map_err(|e| format!("decode durable value at {}: {}", key, e))
     }
 
-    fn read_published_note_bytes(&self, index: u64) -> Result<Option<Vec<u8>>, String> {
+    fn read_u64_at_block(&self, block_ref: &str, key: &str) -> Result<u64, String> {
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_u64(key, &bytes)
+    }
+
+    fn parse_u64(key: &str, bytes: &[u8]) -> Result<u64, String> {
+        if bytes.len() != 8 {
+            return Err(format!(
+                "durable u64 at {} has {} bytes, expected 8",
+                key,
+                bytes.len()
+            ));
+        }
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&bytes);
+        Ok(u64::from_le_bytes(out))
+    }
+
+    fn read_optional_u64_at_block(
+        &self,
+        block_ref: &str,
+        key: &str,
+    ) -> Result<Option<u64>, String> {
+        if self.read_durable_length_at_block(block_ref, key)?.is_none() {
+            return Ok(None);
+        }
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_u64(key, &bytes).map(Some)
+    }
+
+    fn read_optional_i32_at_block(
+        &self,
+        block_ref: &str,
+        key: &str,
+    ) -> Result<Option<i32>, String> {
+        if self.read_durable_length_at_block(block_ref, key)?.is_none() {
+            return Ok(None);
+        }
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_i32(key, &bytes).map(Some)
+    }
+
+    fn parse_i32(key: &str, bytes: &[u8]) -> Result<i32, String> {
+        if bytes.len() != 4 {
+            return Err(format!(
+                "durable i32 at {} has {} bytes, expected 4",
+                key,
+                bytes.len()
+            ));
+        }
+        let mut out = [0u8; 4];
+        out.copy_from_slice(&bytes);
+        Ok(i32::from_le_bytes(out))
+    }
+
+    fn read_felt_at_block(&self, block_ref: &str, key: &str) -> Result<F, String> {
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_felt(key, &bytes)
+    }
+
+    fn parse_felt(key: &str, bytes: &[u8]) -> Result<F, String> {
+        if bytes.len() != 32 {
+            return Err(format!(
+                "durable felt at {} has {} bytes, expected 32",
+                key,
+                bytes.len()
+            ));
+        }
+        let mut out = ZERO;
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    fn read_string_at_block(&self, block_ref: &str, key: &str) -> Result<String, String> {
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_string(key, bytes)
+    }
+
+    fn parse_string(key: &str, bytes: Vec<u8>) -> Result<String, String> {
+        String::from_utf8(bytes).map_err(|_| format!("durable string at {} is not UTF-8", key))
+    }
+
+    fn block_level(&self, block_ref: &str) -> Result<i32, String> {
+        let raw = get_text(&self.block_level_url(block_ref))?;
+        if let Ok(level) = serde_json::from_str::<i32>(&raw) {
+            return Ok(level);
+        }
+        if let Ok(text) = serde_json::from_str::<String>(&raw) {
+            return text
+                .parse::<i32>()
+                .map_err(|e| format!("parse head level integer: {}", e));
+        }
+        raw.trim()
+            .parse::<i32>()
+            .map_err(|e| format!("parse head level integer: {}", e))
+    }
+
+    #[cfg(test)]
+    fn current_required_tx_fee(&self) -> Result<u64, String> {
+        let head_hash = self.head_hash()?;
+        self.current_required_tx_fee_at_block(&head_hash)
+    }
+
+    fn current_required_tx_fee_at_block(&self, block_ref: &str) -> Result<u64, String> {
+        let head_level = self.block_level(block_ref)?;
+        let next_inbox_level = head_level.saturating_add(1);
+        let last_input_level =
+            self.read_optional_i32_at_block(block_ref, DURABLE_LAST_INPUT_LEVEL)?;
+        let fee_level = self.read_optional_i32_at_block(block_ref, DURABLE_PRIVATE_TX_FEE_LEVEL)?;
+        let private_tx_count_in_level =
+            if last_input_level == Some(next_inbox_level) && fee_level == Some(next_inbox_level) {
+                self.read_optional_u64_at_block(block_ref, DURABLE_PRIVATE_TX_COUNT_IN_LEVEL)?
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        Ok(required_tx_fee_for_private_tx_count(
+            private_tx_count_in_level,
+        ))
+    }
+
+    fn load_notes_since(&self, cursor: usize) -> Result<NotesFeedResp, String> {
+        self.load_notes_since_at_block("head", cursor)
+    }
+
+    fn read_published_note_bytes_at_block(
+        &self,
+        block_ref: &str,
+        index: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
         let direct_key = indexed_durable_key(DURABLE_NOTE_PREFIX, index);
-        if self.read_durable_length(&direct_key)?.is_some() {
-            let bytes = self.read_durable_bytes(&direct_key)?;
+        if self
+            .read_durable_length_at_block(block_ref, &direct_key)?
+            .is_some()
+        {
+            let bytes = self.read_durable_bytes_at_block(block_ref, &direct_key)?;
             if bytes.len() > MAX_PUBLISHED_NOTE_BYTES {
                 return Err(format!(
                     "durable note {} at {} exceeds max supported size {}",
@@ -1666,11 +1842,14 @@ impl<'a> RollupRpc<'a> {
         }
 
         let len_key = indexed_durable_note_len_key(index);
-        if self.read_durable_length(&len_key)?.is_none() {
+        if self
+            .read_durable_length_at_block(block_ref, &len_key)?
+            .is_none()
+        {
             return Ok(None);
         }
 
-        let total_len_u64 = self.read_u64(&len_key)?;
+        let total_len_u64 = self.read_u64_at_block(block_ref, &len_key)?;
         let total_len = usize::try_from(total_len_u64).map_err(|_| {
             format!(
                 "chunked durable note {} length does not fit in usize",
@@ -1687,7 +1866,7 @@ impl<'a> RollupRpc<'a> {
         let mut bytes = Vec::with_capacity(total_len);
         for chunk_index in 0..chunk_count {
             let chunk_key = indexed_durable_note_chunk_key(index, chunk_index);
-            let mut chunk = self.read_durable_bytes(&chunk_key)?;
+            let mut chunk = self.read_durable_bytes_at_block(block_ref, &chunk_key)?;
             bytes.append(&mut chunk);
         }
         if bytes.len() != total_len {
@@ -1701,42 +1880,13 @@ impl<'a> RollupRpc<'a> {
         Ok(Some(bytes))
     }
 
-    fn read_u64(&self, key: &str) -> Result<u64, String> {
-        let bytes = self.read_durable_bytes(key)?;
-        if bytes.len() != 8 {
-            return Err(format!(
-                "durable u64 at {} has {} bytes, expected 8",
-                key,
-                bytes.len()
-            ));
-        }
-        let mut out = [0u8; 8];
-        out.copy_from_slice(&bytes);
-        Ok(u64::from_le_bytes(out))
-    }
-
-    fn read_felt(&self, key: &str) -> Result<F, String> {
-        let bytes = self.read_durable_bytes(key)?;
-        if bytes.len() != 32 {
-            return Err(format!(
-                "durable felt at {} has {} bytes, expected 32",
-                key,
-                bytes.len()
-            ));
-        }
-        let mut out = ZERO;
-        out.copy_from_slice(&bytes);
-        Ok(out)
-    }
-
-    fn read_string(&self, key: &str) -> Result<String, String> {
-        let bytes = self.read_durable_bytes(key)?;
-        String::from_utf8(bytes).map_err(|_| format!("durable string at {} is not UTF-8", key))
-    }
-
-    fn load_notes_since(&self, cursor: usize) -> Result<NotesFeedResp, String> {
+    fn load_notes_since_at_block(
+        &self,
+        block_ref: &str,
+        cursor: usize,
+    ) -> Result<NotesFeedResp, String> {
         let count: usize = self
-            .read_u64(DURABLE_TREE_SIZE)?
+            .read_u64_at_block(block_ref, DURABLE_TREE_SIZE)?
             .try_into()
             .map_err(|_| "tree size does not fit in usize".to_string())?;
         if cursor > count {
@@ -1748,7 +1898,7 @@ impl<'a> RollupRpc<'a> {
 
         let mut notes = Vec::with_capacity(count - cursor);
         for i in cursor..count {
-            let Some(bytes) = self.read_published_note_bytes(i as u64)? else {
+            let Some(bytes) = self.read_published_note_bytes_at_block(block_ref, i as u64)? else {
                 let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
                 return Err(format!(
                     "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
@@ -1765,39 +1915,57 @@ impl<'a> RollupRpc<'a> {
     }
 
     fn load_nullifiers(&self) -> Result<Vec<F>, String> {
+        self.load_nullifiers_at_block("head")
+    }
+
+    fn load_nullifiers_at_block(&self, block_ref: &str) -> Result<Vec<F>, String> {
         let count: usize = self
-            .read_u64(DURABLE_NULLIFIER_COUNT)?
+            .read_u64_at_block(block_ref, DURABLE_NULLIFIER_COUNT)?
             .try_into()
             .map_err(|_| "nullifier count does not fit in usize".to_string())?;
         let mut nullifiers = Vec::with_capacity(count);
         for i in 0..count {
-            nullifiers.push(self.read_felt(&indexed_durable_key(
-                DURABLE_NULLIFIER_INDEX_PREFIX,
-                i as u64,
-            ))?);
+            nullifiers.push(self.read_felt_at_block(
+                block_ref,
+                &indexed_durable_key(DURABLE_NULLIFIER_INDEX_PREFIX, i as u64),
+            )?);
         }
         Ok(nullifiers)
     }
 
     fn load_balances(&self) -> Result<std::collections::HashMap<String, u64>, String> {
+        self.load_balances_at_block("head")
+    }
+
+    fn load_balances_at_block(
+        &self,
+        block_ref: &str,
+    ) -> Result<std::collections::HashMap<String, u64>, String> {
         let count: usize = self
-            .read_u64(DURABLE_BALANCE_COUNT)?
+            .read_u64_at_block(block_ref, DURABLE_BALANCE_COUNT)?
             .try_into()
             .map_err(|_| "balance count does not fit in usize".to_string())?;
         let mut balances = std::collections::HashMap::with_capacity(count);
         for i in 0..count {
-            let account =
-                self.read_string(&indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, i as u64))?;
-            let amount = self.read_u64(&balance_durable_key(&account))?;
+            let account = self.read_string_at_block(
+                block_ref,
+                &indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, i as u64),
+            )?;
+            let amount = self.read_u64_at_block(block_ref, &balance_durable_key(&account))?;
             balances.insert(account, amount);
         }
         Ok(balances)
     }
 
     fn load_state_snapshot(&self) -> Result<RollupStateSnapshot, String> {
-        let auth_domain = self.read_felt(DURABLE_AUTH_DOMAIN)?;
-        let notes = self.load_notes_since(0)?.notes;
-        let persisted_root = self.read_felt(DURABLE_TREE_ROOT)?;
+        let head_hash = self.head_hash()?;
+        self.load_state_snapshot_at_block(&head_hash)
+    }
+
+    fn load_state_snapshot_at_block(&self, block_ref: &str) -> Result<RollupStateSnapshot, String> {
+        let auth_domain = self.read_felt_at_block(block_ref, DURABLE_AUTH_DOMAIN)?;
+        let notes = self.load_notes_since_at_block(block_ref, 0)?.notes;
+        let persisted_root = self.read_felt_at_block(block_ref, DURABLE_TREE_ROOT)?;
         let tree = MerkleTree::from_leaves(notes.iter().map(|note| note.cm).collect());
         let recomputed_root = tree.root();
         if recomputed_root != persisted_root {
@@ -1809,6 +1977,7 @@ impl<'a> RollupRpc<'a> {
         }
         Ok(RollupStateSnapshot {
             auth_domain,
+            required_tx_fee: self.current_required_tx_fee_at_block(block_ref)?,
             tree,
             notes,
         })
@@ -1852,13 +2021,14 @@ impl<'a> RollupRpc<'a> {
 
     fn deposit_to_bridge(
         &self,
-        public_account: &str,
+        deposit_id: &F,
         amount_mutez: u64,
     ) -> Result<RollupSubmissionReceipt, String> {
         let tez_amount = mutez_to_tez_string(amount_mutez);
+        let recipient = deposit_balance_key(deposit_id);
         let mint_arg = format!(
             "Pair 0x{} \"{}\"",
-            hex::encode(public_account.as_bytes()),
+            hex::encode(recipient.as_bytes()),
             self.profile.rollup_address
         );
         let mut args = vec![
@@ -1958,9 +2128,9 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
         KernelInboxMessage::Shield(_) => RollupSubmissionKind::Shield,
         KernelInboxMessage::Transfer(_) => RollupSubmissionKind::Transfer,
         KernelInboxMessage::Unshield(_) => RollupSubmissionKind::Unshield,
-        KernelInboxMessage::Withdraw(_)
-        | KernelInboxMessage::ConfigureVerifier(_)
-        | KernelInboxMessage::ConfigureBridge(_) => RollupSubmissionKind::Withdraw,
+        KernelInboxMessage::Withdraw(_) => RollupSubmissionKind::Withdraw,
+        KernelInboxMessage::ConfigureVerifier(_) => RollupSubmissionKind::ConfigureVerifier,
+        KernelInboxMessage::ConfigureBridge(_) => RollupSubmissionKind::ConfigureBridge,
         KernelInboxMessage::DalPointer(_) => {
             unreachable!("wallet should not submit raw DAL pointer messages")
         }
@@ -2105,6 +2275,60 @@ fn mutez_to_tez_string(amount_mutez: u64) -> String {
     out
 }
 
+fn ensure_required_tx_fee(fee: u64, required_fee: u64) -> Result<(), String> {
+    if fee < required_fee {
+        return Err(format!(
+            "fee below minimum: {} mutez < {} mutez ({} tez)",
+            fee,
+            required_fee,
+            mutez_to_tez_string(required_fee),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_requested_tx_fee(requested_fee: Option<u64>, required_fee: u64) -> Result<u64, String> {
+    let fee = requested_fee.unwrap_or(required_fee);
+    ensure_required_tx_fee(fee, required_fee)?;
+    Ok(fee)
+}
+
+fn ensure_positive_dal_fee(dal_fee: u64) -> Result<(), String> {
+    if dal_fee == 0 {
+        return Err("dal_fee must be greater than zero".into());
+    }
+    Ok(())
+}
+
+struct PreparedOutputNote {
+    cm: F,
+    enc: EncryptedNote,
+    mh: F,
+    rseed: F,
+}
+
+fn build_output_note(
+    address: &PaymentAddress,
+    value: u64,
+    memo: Option<&[u8]>,
+) -> Result<PreparedOutputNote, String> {
+    let rseed = random_felt();
+    let rcm = derive_rcm(&rseed);
+    let ek_v = ml_kem::ml_kem_768::EncapsulationKey::new(
+        address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
+    )
+    .map_err(|_| "invalid ek_v")?;
+    let ek_d = ml_kem::ml_kem_768::EncapsulationKey::new(
+        address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
+    )
+    .map_err(|_| "invalid ek_d")?;
+    let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
+    let cm = commit(&address.d_j, value, &rcm, &otag);
+    let enc = encrypt_note(value, &rseed, memo, &ek_v, &ek_d);
+    let mh = memo_ct_hash(&enc);
+    Ok(PreparedOutputNote { cm, enc, mh, rseed })
+}
+
 fn extract_operation_hash(output: &str) -> Option<String> {
     output
         .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '(' | ')'))
@@ -2139,13 +2363,17 @@ fn host_stark_proof_to_kernel(proof: &Proof) -> Result<KernelStarkProof, String>
 
 fn shield_req_to_kernel(req: &ShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
-        sender: req.sender.clone(),
+        deposit_id: req.deposit_id,
+        fee: req.fee,
+        producer_fee: req.producer_fee,
         v: req.v,
         address: req.address.clone(),
         memo: req.memo.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
+        producer_cm: req.producer_cm,
+        producer_enc: req.producer_enc.clone(),
     })
 }
 
@@ -2153,10 +2381,13 @@ fn transfer_req_to_kernel(req: &TransferReq) -> Result<KernelTransferReq, String
     Ok(KernelTransferReq {
         root: req.root,
         nullifiers: req.nullifiers.clone(),
+        fee: req.fee,
         cm_1: req.cm_1,
         cm_2: req.cm_2,
+        cm_3: req.cm_3,
         enc_1: req.enc_1.clone(),
         enc_2: req.enc_2.clone(),
+        enc_3: req.enc_3.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
     })
 }
@@ -2166,9 +2397,12 @@ fn unshield_req_to_kernel(req: &UnshieldReq) -> Result<KernelUnshieldReq, String
         root: req.root,
         nullifiers: req.nullifiers.clone(),
         v_pub: req.v_pub,
+        fee: req.fee,
         recipient: req.recipient.clone(),
         cm_change: req.cm_change,
         enc_change: req.enc_change.clone(),
+        cm_fee: req.cm_fee,
+        enc_fee: req.enc_fee.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
     })
 }
@@ -2240,6 +2474,12 @@ enum Cmd {
         sender: String,
         #[arg(long)]
         amount: u64,
+        #[arg(long)]
+        fee: Option<u64>,
+        #[arg(long)]
+        dal_fee: u64,
+        #[arg(long)]
+        dal_fee_address: String,
         /// Path to recipient address JSON (default: generate new self-address)
         #[arg(long)]
         to: Option<String>,
@@ -2255,6 +2495,12 @@ enum Cmd {
         #[arg(long)]
         amount: u64,
         #[arg(long)]
+        fee: Option<u64>,
+        #[arg(long)]
+        dal_fee: u64,
+        #[arg(long)]
+        dal_fee_address: String,
+        #[arg(long)]
         memo: Option<String>,
     },
     /// Unshield: withdraw private notes to a public address
@@ -2263,6 +2509,12 @@ enum Cmd {
         ledger: String,
         #[arg(long)]
         amount: u64,
+        #[arg(long)]
+        fee: Option<u64>,
+        #[arg(long)]
+        dal_fee: u64,
+        #[arg(long)]
+        dal_fee_address: String,
         #[arg(long)]
         recipient: String,
     },
@@ -2331,20 +2583,59 @@ fn run(cli: Cli) -> Result<(), String> {
             ledger,
             sender,
             amount,
+            fee,
+            dal_fee,
+            dal_fee_address,
             to,
             memo,
-        } => cmd_shield(&cli.wallet, &ledger, &sender, amount, to, memo, &pc),
+        } => cmd_shield(
+            &cli.wallet,
+            &ledger,
+            &sender,
+            amount,
+            fee,
+            dal_fee,
+            &dal_fee_address,
+            to,
+            memo,
+            &pc,
+        ),
         Cmd::Transfer {
             ledger,
             to,
             amount,
+            fee,
+            dal_fee,
+            dal_fee_address,
             memo,
-        } => cmd_transfer(&cli.wallet, &ledger, &to, amount, memo, &pc),
+        } => cmd_transfer(
+            &cli.wallet,
+            &ledger,
+            &to,
+            amount,
+            fee,
+            dal_fee,
+            &dal_fee_address,
+            memo,
+            &pc,
+        ),
         Cmd::Unshield {
             ledger,
             amount,
+            fee,
+            dal_fee,
+            dal_fee_address,
             recipient,
-        } => cmd_unshield(&cli.wallet, &ledger, amount, &recipient, &pc),
+        } => cmd_unshield(
+            &cli.wallet,
+            &ledger,
+            amount,
+            fee,
+            dal_fee,
+            &dal_fee_address,
+            &recipient,
+            &pc,
+        ),
         Cmd::Fund {
             ledger,
             addr,
@@ -2402,20 +2693,20 @@ enum UserCmd {
     Balance,
     /// Check whether the wallet profile, operator, and rollup node are usable.
     Check,
-    /// Deposit tez on L1 into the configured bridge ticketer for your public rollup account.
+    /// Deposit tez on L1 into the configured bridge ticketer for a secret-bound shield.
     Deposit {
         #[arg(long)]
         amount: u64,
-        #[arg(long)]
-        public_account: Option<String>,
     },
     /// Shield public bridge balance into a private note.
     Shield {
         #[arg(long)]
         amount: u64,
-        /// Override the public rollup account to shield from.
         #[arg(long)]
-        sender: Option<String>,
+        fee: Option<u64>,
+        /// Select a pending secret-bound deposit by its deposit id.
+        #[arg(long)]
+        deposit_id: Option<String>,
         /// Path to recipient address JSON. Defaults to a newly generated self-address.
         #[arg(long)]
         to: Option<String>,
@@ -2429,12 +2720,16 @@ enum UserCmd {
         #[arg(long)]
         amount: u64,
         #[arg(long)]
+        fee: Option<u64>,
+        #[arg(long)]
         memo: Option<String>,
     },
     /// Move private funds back into a public rollup balance.
     Unshield {
         #[arg(long)]
         amount: u64,
+        #[arg(long)]
+        fee: Option<u64>,
         /// Override the public rollup account to receive the transparent balance.
         #[arg(long)]
         recipient: Option<String>,
@@ -2504,6 +2799,10 @@ enum UserProfileCmd {
         rollup_address: String,
         #[arg(long)]
         bridge_ticketer: String,
+        #[arg(long)]
+        dal_fee: u64,
+        #[arg(long)]
+        dal_fee_address: String,
         #[arg(long, requires = "operator_bearer_token")]
         operator_url: Option<String>,
         #[arg(long, requires = "operator_url")]
@@ -2635,13 +2934,13 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Init
         | UserCmd::Receive
         | UserCmd::Sync { .. }
+        | UserCmd::Deposit { .. }
         | UserCmd::Shield { .. }
         | UserCmd::Send { .. }
         | UserCmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
         UserCmd::Profile { .. }
         | UserCmd::Balance
         | UserCmd::Check
-        | UserCmd::Deposit { .. }
         | UserCmd::Status { .. }
         | UserCmd::Withdraw { .. }
         | UserCmd::ExportDetect { .. }
@@ -2680,32 +2979,46 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_wallet_check(&cli.wallet, &profile)
         }
-        UserCmd::Deposit {
-            amount,
-            public_account,
-        } => {
+        UserCmd::Deposit { amount } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            let public_account = public_account.unwrap_or_else(|| profile.public_account.clone());
-            cmd_bridge_deposit(&profile, amount, &public_account)
+            cmd_bridge_deposit(&cli.wallet, &profile, amount)
         }
         UserCmd::Shield {
             amount,
-            sender,
+            fee,
+            deposit_id,
             to,
             memo,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            let sender = sender.unwrap_or_else(|| profile.public_account.clone());
-            cmd_shield_rollup(&cli.wallet, &profile, &sender, amount, to, memo, &pc)
+            cmd_shield_rollup(
+                &cli.wallet,
+                &profile,
+                deposit_id.as_deref(),
+                amount,
+                fee,
+                to,
+                memo,
+                &pc,
+            )
         }
-        UserCmd::Send { to, amount, memo } => {
+        UserCmd::Send {
+            to,
+            amount,
+            fee,
+            memo,
+        } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_transfer_rollup(&cli.wallet, &profile, &to, amount, memo, &pc)
+            cmd_transfer_rollup(&cli.wallet, &profile, &to, amount, fee, memo, &pc)
         }
-        UserCmd::Unshield { amount, recipient } => {
+        UserCmd::Unshield {
+            amount,
+            fee,
+            recipient,
+        } => {
             let profile = load_required_network_profile(&cli.wallet)?;
             let recipient = recipient.unwrap_or_else(|| profile.public_account.clone());
-            cmd_unshield_rollup(&cli.wallet, &profile, amount, &recipient, &pc)
+            cmd_unshield_rollup(&cli.wallet, &profile, amount, fee, &recipient, &pc)
         }
         UserCmd::Withdraw {
             amount,
@@ -2733,6 +3046,8 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
             rollup_node_url,
             rollup_address,
             bridge_ticketer,
+            dal_fee,
+            dal_fee_address,
             operator_url,
             operator_bearer_token,
             source_alias,
@@ -2750,10 +3065,13 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
                     path.display()
                 ));
             }
+            let dal_fee_address = load_address(&dal_fee_address)?;
             let profile = shadownet_profile(
                 rollup_node_url,
                 rollup_address,
                 bridge_ticketer,
+                dal_fee,
+                dal_fee_address,
                 operator_url,
                 operator_bearer_token,
                 source_alias,
@@ -2803,6 +3121,27 @@ fn felt_to_hex(f: &F) -> String {
 
 fn felt_u64_to_hex(v: u64) -> String {
     format!("0x{:x}", v)
+}
+
+fn parse_deposit_id_hex(value: &str) -> Result<F, String> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    let value = value
+        .strip_prefix(DEPOSIT_BALANCE_KEY_PREFIX)
+        .unwrap_or(value);
+    let bytes = hex::decode(value).map_err(|e| format!("invalid deposit id hex: {}", e))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "invalid deposit id: expected 32 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut out = ZERO;
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn deposit_id_hex(deposit_id: &F) -> String {
+    hex::encode(deposit_id)
 }
 
 /// Call the reprover to generate a ZK proof.
@@ -2893,6 +3232,7 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
         scanned: 0,
         wots_key_indices: std::collections::HashMap::new(),
         pending_spends: vec![],
+        pending_deposits: vec![],
     };
     save_wallet(path, &w)?;
     println!("Wallet created: {}", path);
@@ -3201,11 +3541,14 @@ mod tests {
     }
 
     pub(super) fn rollup_profile_for_url(base_url: &str) -> WalletNetworkProfile {
+        let wallet = test_wallet(1);
         WalletNetworkProfile {
             network: "shadownet".into(),
             rollup_node_url: base_url.into(),
             rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
             bridge_ticketer: "KT1Jg4fj5wwnKHuW8aa9uDX6dRYBdjXhm2sJ".into(),
+            dal_fee: 1,
+            dal_fee_address: payment_address_for_wallet_address(&wallet, 0),
             public_account: "alice".into(),
             operator_url: None,
             operator_bearer_token: None,
@@ -3297,6 +3640,7 @@ mod tests {
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
+            pending_deposits: vec![],
         };
         if addr_counter as usize > cached {
             wallet
@@ -3370,7 +3714,7 @@ mod tests {
         }
     }
 
-    fn payment_address_for_wallet_address(w: &WalletFile, j: u32) -> PaymentAddress {
+    pub(super) fn payment_address_for_wallet_address(w: &WalletFile, j: u32) -> PaymentAddress {
         let (ek_v, _, ek_d, _) = w.kem_keys(j);
         w.addresses[j as usize].payment_address(&ek_v, &ek_d)
     }
@@ -4265,6 +4609,7 @@ mod tests {
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
+            pending_deposits: vec![],
         };
 
         let (state0, addr0) = wallet.next_address().expect("first fixture address");
@@ -4289,6 +4634,7 @@ mod tests {
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
+            pending_deposits: vec![],
         };
 
         wallet
@@ -4739,15 +5085,24 @@ mod tests {
             .map(|n| nullifier(&n.nk_spend, &n.cm, n.index as u64))
             .collect();
         let change_addr = w.addresses[1].clone();
+        let producer_address = payment_address_for_wallet_address(&w, 0);
         let (_ek_v0, dk_v0, _ek_d0, dk_d0) = w.kem_keys(0);
         let (_ek_v1, dk_v1, _ek_d1, dk_d1) = w.kem_keys(1);
 
         let ledger_root = felt_tag(b"wallet-transfer-root");
         let recipient = load_address(recipient_path_str).expect("recipient should load");
         let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
-        let prepared =
-            prepare_transfer_skip_proof(&mut loaded, ledger_root, &recipient, 50, Some("memo-1"))
-                .expect("skip-proof transfer request should build");
+        let prepared = prepare_transfer_skip_proof(
+            &mut loaded,
+            ledger_root,
+            &recipient,
+            50,
+            0,
+            1,
+            &producer_address,
+            Some("memo-1"),
+        )
+        .expect("skip-proof transfer request should build");
         save_wallet(wallet_path_str, &loaded).expect("wallet should save before submit");
         let req = &prepared.req;
 
@@ -4784,7 +5139,7 @@ mod tests {
         assert!(detect(&req.enc_2, &dk_d1));
         let (change_value, change_rseed, change_memo) =
             decrypt_memo(&req.enc_2, &dk_v1).expect("change note should decrypt");
-        assert_eq!(change_value, 15);
+        assert_eq!(change_value, 14);
         assert_eq!(change_memo[0], 0xF6);
         let change_otag = owner_tag(
             &change_addr.auth_root,
@@ -4799,6 +5154,26 @@ mod tests {
                 &change_otag
             ),
             req.cm_2
+        );
+
+        assert!(detect(&req.enc_3, &dk_d0));
+        let (producer_value, producer_rseed, producer_memo) =
+            decrypt_memo(&req.enc_3, &dk_v0).expect("producer note should decrypt");
+        assert_eq!(producer_value, 1);
+        assert_eq!(&producer_memo[..3], b"dal");
+        let producer_otag = owner_tag(
+            &producer_address.auth_root,
+            &producer_address.auth_pub_seed,
+            &producer_address.nk_tag,
+        );
+        assert_eq!(
+            commit(
+                &producer_address.d_j,
+                producer_value,
+                &derive_rcm(&producer_rseed),
+                &producer_otag
+            ),
+            req.cm_3
         );
 
         finalize_successful_spend(wallet_path_str, &mut loaded, &prepared.selected)
@@ -4830,12 +5205,22 @@ mod tests {
             .map(|n| nullifier(&n.nk_spend, &n.cm, n.index as u64))
             .collect();
         let change_addr = w.addresses[1].clone();
+        let producer_address = payment_address_for_wallet_address(&w, 0);
+        let (_ek_v0, dk_v0, _ek_d0, dk_d0) = w.kem_keys(0);
         let (_ek_v1, dk_v1, _ek_d1, dk_d1) = w.kem_keys(1);
 
         let ledger_root = felt_tag(b"wallet-unshield-root");
         let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
-        let prepared = prepare_unshield_skip_proof(&mut loaded, ledger_root, 50, "bob")
-            .expect("skip-proof unshield request should build");
+        let prepared = prepare_unshield_skip_proof(
+            &mut loaded,
+            ledger_root,
+            50,
+            0,
+            1,
+            &producer_address,
+            "bob",
+        )
+        .expect("skip-proof unshield request should build");
         save_wallet(wallet_path_str, &loaded).expect("wallet should save before submit");
         let req = &prepared.req;
 
@@ -4859,7 +5244,7 @@ mod tests {
         assert!(detect(enc_change, &dk_d1));
         let (change_value, change_rseed, change_memo) =
             decrypt_memo(enc_change, &dk_v1).expect("change note should decrypt");
-        assert_eq!(change_value, 15);
+        assert_eq!(change_value, 14);
         assert_eq!(change_memo[0], 0xF6);
         let change_otag = owner_tag(
             &change_addr.auth_root,
@@ -4874,6 +5259,26 @@ mod tests {
                 &change_otag
             ),
             req.cm_change
+        );
+
+        assert!(detect(&req.enc_fee, &dk_d0));
+        let (producer_value, producer_rseed, producer_memo) =
+            decrypt_memo(&req.enc_fee, &dk_v0).expect("producer note should decrypt");
+        assert_eq!(producer_value, 1);
+        assert_eq!(&producer_memo[..3], b"dal");
+        let producer_otag = owner_tag(
+            &producer_address.auth_root,
+            &producer_address.auth_pub_seed,
+            &producer_address.nk_tag,
+        );
+        assert_eq!(
+            commit(
+                &producer_address.d_j,
+                producer_value,
+                &derive_rcm(&producer_rseed),
+                &producer_otag
+            ),
+            req.cm_fee
         );
 
         finalize_successful_spend(wallet_path_str, &mut loaded, &prepared.selected)
@@ -5040,14 +5445,26 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
     if profile_path.exists() {
         let profile = load_network_profile(&profile_path)?;
         let rollup = RollupRpc::new(&profile);
-        let public_balance = rollup
-            .load_balances()?
-            .get(&profile.public_account)
-            .copied()
-            .unwrap_or(0);
+        let balances = rollup.load_balances()?;
+        let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+        let pending_deposit_balance = w
+            .pending_deposits
+            .iter()
+            .map(|deposit| {
+                balances
+                    .get(&deposit_balance_key(&deposit.deposit_id))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
         println!(
             "Public rollup balance ({}): {}",
             profile.public_account, public_balance
+        );
+        println!(
+            "Secret-bound deposit balance: {} across {} pending deposits",
+            pending_deposit_balance,
+            w.pending_deposits.len()
         );
     }
     Ok(())
@@ -5057,19 +5474,33 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     let wallet = load_wallet(path)?;
     let rollup = RollupRpc::new(profile);
     let head_hash = rollup.head_hash()?;
-    let auth_domain = rollup.read_felt(DURABLE_AUTH_DOMAIN)?;
-    let tree_size = rollup.read_u64(DURABLE_TREE_SIZE)?;
-    let public_balance = rollup
-        .load_balances()?
-        .get(&profile.public_account)
-        .copied()
-        .unwrap_or(0);
+    let snapshot = rollup.load_state_snapshot_at_block(&head_hash)?;
+    let auth_domain = snapshot.auth_domain;
+    let tree_size = snapshot.tree.leaves.len();
+    let required_tx_fee = snapshot.required_tx_fee;
+    let balances = rollup.load_balances_at_block(&head_hash)?;
+    let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+    let pending_deposit_balance = wallet
+        .pending_deposits
+        .iter()
+        .map(|deposit| {
+            balances
+                .get(&deposit_balance_key(&deposit.deposit_id))
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
 
     println!("Wallet file: {}", path);
     println!("Network: {}", profile.network);
     println!("Rollup head: {}", head_hash);
     println!("Auth domain: {}", short(&auth_domain));
     println!("Tree size: {}", tree_size);
+    println!(
+        "Current required burn fee: {} mutez ({} tez)",
+        required_tx_fee,
+        mutez_to_tez_string(required_tx_fee)
+    );
     println!(
         "Local wallet: notes={}, pending={}, scanned={}",
         wallet.notes.len(),
@@ -5080,6 +5511,11 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
         "Public rollup balance ({}): {}",
         profile.public_account, public_balance
     );
+    println!(
+        "Secret-bound deposit balance: {} across {} pending deposits",
+        pending_deposit_balance,
+        wallet.pending_deposits.len()
+    );
 
     if let Some(operator_url) = &profile.operator_url {
         let health_url = format!("{}/healthz", operator_url.trim_end_matches('/'));
@@ -5087,20 +5523,6 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
         println!("Operator health: {}", health.trim());
     } else {
         println!("Operator health: not configured");
-    }
-
-    let note_check_limit = usize::try_from(tree_size)
-        .unwrap_or(usize::MAX)
-        .min(wallet.scanned.max(1))
-        .min(4);
-    for index in 0..note_check_limit {
-        let key = indexed_durable_key(DURABLE_NOTE_PREFIX, index as u64);
-        if rollup.read_published_note_bytes(index as u64)?.is_none() {
-            return Err(format!(
-                "rollup durable note {} is missing at {} while tree size is {}. This deployment cannot serve private note sync correctly.",
-                index, key, tree_size
-            ));
-        }
     }
 
     println!("Check passed");
@@ -5119,18 +5541,26 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
     let nullifiers = rollup.load_nullifiers()?;
     let summary = apply_scan_feed(&mut w, &feed, nullifiers);
     save_wallet(path, &w)?;
-    let public_balance = rollup
-        .load_balances()?
-        .get(&profile.public_account)
-        .copied()
-        .unwrap_or(0);
+    let balances = rollup.load_balances()?;
+    let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+    let pending_deposit_balance = w
+        .pending_deposits
+        .iter()
+        .map(|deposit| {
+            balances
+                .get(&deposit_balance_key(&deposit.deposit_id))
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
     println!(
-        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, public_balance={}",
+        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, public_balance={}, secret_deposit_balance={}",
         summary.found,
         summary.spent,
         summary.confirmed_pending,
         w.available_balance(),
-        public_balance
+        public_balance,
+        pending_deposit_balance
     );
     Ok(())
 }
@@ -5151,16 +5581,68 @@ fn cmd_rollup_sync_watch(
     }
 }
 
+fn select_pending_deposit<'a>(
+    wallet: &'a WalletFile,
+    balances: &std::collections::HashMap<String, u64>,
+    requested_deposit_id: Option<F>,
+    total_debit: u64,
+) -> Result<(&'a PendingDeposit, u64), String> {
+    let mut saw_requested = false;
+    for deposit in &wallet.pending_deposits {
+        if let Some(requested) = requested_deposit_id {
+            if deposit.deposit_id != requested {
+                continue;
+            }
+            saw_requested = true;
+        }
+        let balance = balances
+            .get(&deposit_balance_key(&deposit.deposit_id))
+            .copied()
+            .unwrap_or(0);
+        if balance >= total_debit {
+            return Ok((deposit, balance));
+        }
+    }
+
+    if requested_deposit_id.is_some() && !saw_requested {
+        return Err("requested deposit id is not tracked by this wallet".into());
+    }
+    Err(format!(
+        "no tracked secret-bound deposit has enough rollup balance: need {}",
+        total_debit
+    ))
+}
+
 fn cmd_bridge_deposit(
+    path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
-    public_account: &str,
 ) -> Result<(), String> {
+    let mut wallet = load_wallet(path)?;
+    let secret = random_felt();
+    let deposit_id = deposit_id_from_secret(&secret);
+    wallet.pending_deposits.push(PendingDeposit {
+        deposit_id,
+        secret,
+        amount,
+        operation_hash: None,
+    });
+    save_wallet(path, &wallet)?;
+
     let rollup = RollupRpc::new(profile);
-    let submission = rollup.deposit_to_bridge(public_account, amount)?;
+    let submission = rollup.deposit_to_bridge(&deposit_id, amount)?;
+    if let Some(pending) = wallet
+        .pending_deposits
+        .iter_mut()
+        .find(|pending| pending.deposit_id == deposit_id && pending.secret == secret)
+    {
+        pending.operation_hash = submission.operation_hash.clone();
+    }
+    save_wallet(path, &wallet)?;
     println!(
-        "Submitted L1 bridge deposit of {} mutez for public account {}",
-        amount, public_account
+        "Submitted L1 bridge deposit of {} mutez for deposit {}",
+        amount,
+        deposit_id_hex(&deposit_id)
     );
     if let Some(op_hash) = submission.operation_hash {
         println!("Operation hash: {}", op_hash);
@@ -5168,7 +5650,7 @@ fn cmd_bridge_deposit(
     if !submission.output.is_empty() {
         println!("{}", submission.output);
     }
-    println!("Run `tzel-wallet sync` after the deposit is included and processed by the rollup.");
+    println!("Run `tzel-wallet shield --amount ...` after the deposit is processed by the rollup.");
     Ok(())
 }
 
@@ -5213,11 +5695,18 @@ fn cmd_shield(
     ledger: &str,
     sender: &str,
     amount: u64,
+    fee: Option<u64>,
+    dal_fee: u64,
+    dal_fee_address_path: &str,
     to: Option<String>,
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+    let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
+    ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
+    let producer_address = load_address(dal_fee_address_path)?;
 
     let (address, generated_self_address) = if let Some(addr_path) = to {
         (load_address(&addr_path)?, false)
@@ -5226,58 +5715,50 @@ fn cmd_shield(
         (addr, true)
     };
 
-    // Build the proof if --prove is set.
-    // Shield witness: [v_pub, cm_new, sender, memo_ct_hash, auth_root, nk_tag, d_j, rseed]
-    // Note: with TrustMeBro, the ledger generates rseed and computes the commitment.
-    // With a real proof, the client must do this and prove it.
-    let (proof, shield_cm, shield_enc) = if !pc.skip_proof {
-        let rseed = random_felt();
-        let rcm = derive_rcm(&rseed);
-        let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
-        let cm = commit(&address.d_j, amount, &rcm, &otag);
-
-        // sender as felt252
-        let sender_f = hash(sender.as_bytes());
-
-        // Create encrypted note to compute memo hash
-        let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-            address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
-        )
-        .map_err(|_| "invalid ek_v")?;
-        let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-            address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
-        )
-        .map_err(|_| "invalid ek_d")?;
-        let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
-        let enc = encrypt_note(amount, &rseed, memo_bytes, &ek_v_recv, &ek_d_recv);
-        let memo_ct_hash_f = memo_ct_hash(&enc);
-
+    let client_note = build_output_note(&address, amount, memo.as_deref().map(str::as_bytes))?;
+    let producer_note = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
+    let proof = if !pc.skip_proof {
+        let deposit_secret = deposit_secret_from_label(sender);
+        let deposit_id = deposit_id_from_secret(&deposit_secret);
         let args: Vec<String> = vec![
-            felt_u64_to_hex(9), // Array length prefix
+            felt_u64_to_hex(19),
             felt_u64_to_hex(amount),
-            felt_to_hex(&cm),
-            felt_to_hex(&sender_f),
-            felt_to_hex(&memo_ct_hash_f),
+            felt_u64_to_hex(fee),
+            felt_u64_to_hex(dal_fee),
+            felt_to_hex(&client_note.cm),
+            felt_to_hex(&producer_note.cm),
+            felt_to_hex(&deposit_id),
+            felt_to_hex(&client_note.mh),
+            felt_to_hex(&producer_note.mh),
+            felt_to_hex(&deposit_secret),
             felt_to_hex(&address.auth_root),
             felt_to_hex(&address.auth_pub_seed),
             felt_to_hex(&address.nk_tag),
             felt_to_hex(&address.d_j),
-            felt_to_hex(&rseed),
+            felt_to_hex(&client_note.rseed),
+            felt_to_hex(&producer_address.auth_root),
+            felt_to_hex(&producer_address.auth_pub_seed),
+            felt_to_hex(&producer_address.nk_tag),
+            felt_to_hex(&producer_address.d_j),
+            felt_to_hex(&producer_note.rseed),
         ];
-        let proof = pc.make_proof("run_shield", &args)?;
-        (proof, cm, Some(enc))
+        pc.make_proof("run_shield", &args)?
     } else {
-        (Proof::TrustMeBro, ZERO, None)
+        Proof::TrustMeBro
     };
 
     let req = ShieldReq {
-        sender: sender.into(),
+        deposit_id: deposit_id_from_label(sender),
+        fee,
+        producer_fee: dal_fee,
         v: amount,
         address,
         memo,
         proof,
-        client_cm: shield_cm,
-        client_enc: shield_enc,
+        client_cm: client_note.cm,
+        client_enc: Some(client_note.enc),
+        producer_cm: producer_note.cm,
+        producer_enc: Some(producer_note.enc),
     };
     if generated_self_address {
         // Persist generated self-addresses before submission so a crash after a
@@ -5287,8 +5768,10 @@ fn cmd_shield(
     let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)?;
     save_wallet(path, &w)?;
     println!(
-        "Shielded {} -> cm={} index={}",
+        "Shielded {} (fee {}, dal fee {}) -> cm={} index={}",
         amount,
+        fee,
+        dal_fee,
         short(&resp.cm),
         resp.index
     );
@@ -5301,34 +5784,53 @@ fn cmd_transfer(
     ledger: &str,
     to_path: &str,
     amount: u64,
+    fee: Option<u64>,
+    dal_fee: u64,
+    dal_fee_address_path: &str,
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+    let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
+    ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
     let recipient = load_address(to_path)?;
+    let producer_address = load_address(dal_fee_address_path)?;
 
     // Get current root
     let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))?;
     let root = tree_info.root;
 
     if pc.skip_proof {
-        let prepared =
-            prepare_transfer_skip_proof(&mut w, root, &recipient, amount, memo.as_deref())?;
+        let prepared = prepare_transfer_skip_proof(
+            &mut w,
+            root,
+            &recipient,
+            amount,
+            fee,
+            dal_fee,
+            &producer_address,
+            memo.as_deref(),
+        )?;
         save_wallet(path, &w)?;
         let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &prepared.req)?;
         finalize_successful_spend(path, &mut w, &prepared.selected)?;
         println!(
-            "Transferred {} to recipient, change={} (idx={},{})",
-            amount, prepared.change, resp.index_1, resp.index_2
+            "Transferred {} to recipient, fee={}, dal fee={}, change={} (idx={},{},{})",
+            amount, fee, dal_fee, prepared.change, resp.index_1, resp.index_2, resp.index_3
         );
         println!("Run 'scan' to pick up change note.");
         return Ok(());
     }
 
     // Select notes
-    let selected = w.select_notes(amount)?;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(dal_fee))
+        .ok_or_else(|| "transfer total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - dal_fee as u128) as u64;
 
     // Compute nullifiers
     let nullifiers: Vec<F> = selected
@@ -5339,49 +5841,16 @@ fn cmd_transfer(
         })
         .collect();
 
-    // Build output 1: recipient
-    let rseed_1 = random_felt();
-    let rcm_1 = derive_rcm(&rseed_1);
-    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_v
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_v")?,
-    )
-    .map_err(|_| "invalid ek_v")?;
-    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_d
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_d")?,
-    )
-    .map_err(|_| "invalid ek_d")?;
-    let otag_1 = owner_tag(
-        &recipient.auth_root,
-        &recipient.auth_pub_seed,
-        &recipient.nk_tag,
-    );
-    let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
-    let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
-    let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
+    let note_1 = build_output_note(&recipient, amount, memo.as_deref().map(str::as_bytes))?;
 
     // Build output 2: change to self (per-address KEM keys)
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-    let rseed_2 = random_felt();
-    let rcm_2 = derive_rcm(&rseed_2);
-    let otag_2 = owner_tag(
-        &change_state.auth_root,
-        &change_state.auth_pub_seed,
-        &change_state.nk_tag,
-    );
-    let cm_2 = commit(&change_state.d_j, change, &rcm_2, &otag_2);
-    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
+    let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+    let note_2 = build_output_note(&change_address, change, None)?;
+    let note_3 = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
 
     let proof = if !pc.skip_proof {
-        let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
         let auth_domain = cfg.auth_domain;
 
         // Build witness for run_transfer with WOTS+ w=4 inside the STARK.
@@ -5405,10 +5874,18 @@ fn cmd_transfer(
                 nullifier(&n.nk_spend, &n.cm, n.index as u64)
             })
             .collect();
-        let mh_1 = memo_ct_hash(&enc_1);
-        let mh_2 = memo_ct_hash(&enc_2);
-        let sighash =
-            transfer_sighash(&auth_domain, &root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
+        let sighash = transfer_sighash(
+            &auth_domain,
+            &root,
+            &nfs_for_sh,
+            fee,
+            &note_1.cm,
+            &note_2.cm,
+            &note_3.cm,
+            &note_1.mh,
+            &note_2.mh,
+            &note_3.mh,
+        );
 
         let mut wots_key_indices: Vec<u32> = vec![];
         let mut auth_pub_seeds: Vec<F> = vec![];
@@ -5443,11 +5920,12 @@ fn cmd_transfer(
             wots_key_indices.push(key_idx);
         }
 
-        let total_fields = 3 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 16;
+        let total_fields = 4 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 24;
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
+        args.push(felt_u64_to_hex(fee));
 
         // Per-input scalar fields (8 per input)
         for (idx, &si) in selected.iter().enumerate() {
@@ -5481,24 +5959,34 @@ fn cmd_transfer(
         }
 
         // Output 1
-        args.push(felt_to_hex(&cm_1));
+        args.push(felt_to_hex(&note_1.cm));
         args.push(felt_to_hex(&recipient.d_j));
         args.push(felt_u64_to_hex(amount));
-        args.push(felt_to_hex(&rseed_1));
+        args.push(felt_to_hex(&note_1.rseed));
         args.push(felt_to_hex(&recipient.auth_root));
         args.push(felt_to_hex(&recipient.auth_pub_seed));
         args.push(felt_to_hex(&recipient.nk_tag));
-        args.push(felt_to_hex(&memo_ct_hash(&enc_1)));
+        args.push(felt_to_hex(&note_1.mh));
 
         // Output 2
-        args.push(felt_to_hex(&cm_2));
+        args.push(felt_to_hex(&note_2.cm));
         args.push(felt_to_hex(&change_state.d_j));
         args.push(felt_u64_to_hex(change));
-        args.push(felt_to_hex(&rseed_2));
+        args.push(felt_to_hex(&note_2.rseed));
         args.push(felt_to_hex(&change_state.auth_root));
         args.push(felt_to_hex(&change_state.auth_pub_seed));
         args.push(felt_to_hex(&change_state.nk_tag));
-        args.push(felt_to_hex(&memo_ct_hash(&enc_2)));
+        args.push(felt_to_hex(&note_2.mh));
+
+        // Output 3
+        args.push(felt_to_hex(&note_3.cm));
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_u64_to_hex(dal_fee));
+        args.push(felt_to_hex(&note_3.rseed));
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&note_3.mh));
 
         // Persist consumed WOTS+ leaf reservations before handing witness material
         // to the prover. If proving fails, the keys stay burned instead of being
@@ -5515,10 +6003,13 @@ fn cmd_transfer(
     let req = TransferReq {
         root,
         nullifiers,
-        cm_1,
-        cm_2,
-        enc_1,
-        enc_2,
+        fee,
+        cm_1: note_1.cm,
+        cm_2: note_2.cm,
+        cm_3: note_3.cm,
+        enc_1: note_1.enc,
+        enc_2: note_2.enc,
+        enc_3: note_3.enc,
         proof,
     };
     let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &req)?;
@@ -5526,8 +6017,8 @@ fn cmd_transfer(
     finalize_successful_spend(path, &mut w, &selected)?;
 
     println!(
-        "Transferred {} to recipient, change={} (idx={},{})",
-        amount, change, resp.index_1, resp.index_2
+        "Transferred {} to recipient, fee={}, dal fee={}, change={} (idx={},{},{})",
+        amount, fee, dal_fee, change, resp.index_1, resp.index_2, resp.index_3
     );
     println!("Run 'scan' to pick up change note.");
     Ok(())
@@ -5537,22 +6028,43 @@ fn cmd_unshield(
     path: &str,
     ledger: &str,
     amount: u64,
+    fee: Option<u64>,
+    dal_fee: u64,
+    dal_fee_address_path: &str,
     recipient: &str,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+    let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
+    ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
+    let producer_address = load_address(dal_fee_address_path)?;
 
     let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))?;
     let root = tree_info.root;
 
     if pc.skip_proof {
-        let prepared = prepare_unshield_skip_proof(&mut w, root, amount, recipient)?;
+        let prepared = prepare_unshield_skip_proof(
+            &mut w,
+            root,
+            amount,
+            fee,
+            dal_fee,
+            &producer_address,
+            recipient,
+        )?;
         save_wallet(path, &w)?;
         let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &prepared.req)?;
         finalize_successful_spend(path, &mut w, &prepared.selected)?;
         println!(
-            "Unshielded {} to {}, change={} (change_idx={:?})",
-            amount, recipient, prepared.change, resp.change_index
+            "Unshielded {} to {}, fee={}, dal fee={}, change={} (change_idx={:?}, producer_idx={})",
+            amount,
+            recipient,
+            fee,
+            dal_fee,
+            prepared.change,
+            resp.change_index,
+            resp.producer_index
         );
         if prepared.change > 0 {
             println!("Run 'scan' to pick up change note.");
@@ -5560,9 +6072,13 @@ fn cmd_unshield(
         return Ok(());
     }
 
-    let selected = w.select_notes(amount)?;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(dal_fee))
+        .ok_or_else(|| "unshield total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - dal_fee as u128) as u64;
 
     let nullifiers: Vec<F> = selected
         .iter()
@@ -5575,31 +6091,23 @@ fn cmd_unshield(
     let (cm_change, enc_change, change_data) = if change > 0 {
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-        let rseed_c = random_felt();
-        let rcm_c = derive_rcm(&rseed_c);
-        let otag_c = owner_tag(
-            &change_state.auth_root,
-            &change_state.auth_pub_seed,
-            &change_state.nk_tag,
-        );
-        let cm = commit(&change_state.d_j, change, &rcm_c, &otag_c);
-        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
-        let mh = memo_ct_hash(&enc);
+        let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+        let note = build_output_note(&change_address, change, None)?;
         let cd = ChangeData {
             d_j: change_state.d_j,
-            rseed: rseed_c,
+            rseed: note.rseed,
             auth_root: change_state.auth_root,
             auth_pub_seed: change_state.auth_pub_seed,
             nk_tag: change_state.nk_tag,
-            mh,
+            mh: note.mh,
         };
-        (cm, Some(enc), Some(cd))
+        (note.cm, Some(note.enc), Some(cd))
     } else {
         (ZERO, None, None)
     };
+    let producer_note = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
 
     let proof = if !pc.skip_proof {
-        let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
         let auth_domain = cfg.auth_domain;
 
         let n = selected.len();
@@ -5626,9 +6134,12 @@ fn cmd_unshield(
             &root,
             &nfs_for_sh,
             amount,
+            fee,
             &recipient_f,
             &cm_change,
             &mh_change_f,
+            &producer_note.cm,
+            &producer_note.mh,
         );
 
         let mut wots_key_indices: Vec<u32> = vec![];
@@ -5662,12 +6173,13 @@ fn cmd_unshield(
             wots_key_indices.push(key_idx);
         }
 
-        let total = 5 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 8;
+        let total = 6 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 15;
         args.push(felt_u64_to_hex(total as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
         args.push(felt_u64_to_hex(amount));
+        args.push(felt_u64_to_hex(fee));
         args.push(felt_to_hex(&recipient_f));
 
         for (idx, &si) in selected.iter().enumerate() {
@@ -5715,6 +6227,14 @@ fn cmd_unshield(
             }
         }
 
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_u64_to_hex(dal_fee));
+        args.push(felt_to_hex(&producer_note.rseed));
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&producer_note.mh));
+
         // Persist consumed WOTS+ leaf reservations before handing witness material
         // to the prover. If proving fails, the keys stay burned instead of being
         // silently reused on retry.
@@ -5730,9 +6250,12 @@ fn cmd_unshield(
         root,
         nullifiers,
         v_pub: amount,
+        fee,
         recipient: recipient.into(),
         cm_change,
         enc_change,
+        cm_fee: producer_note.cm,
+        enc_fee: producer_note.enc,
         proof,
     };
     let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &req)?;
@@ -5740,8 +6263,8 @@ fn cmd_unshield(
     finalize_successful_spend(path, &mut w, &selected)?;
 
     println!(
-        "Unshielded {} to {}, change={} (change_idx={:?})",
-        amount, recipient, change, resp.change_index
+        "Unshielded {} to {}, fee={}, dal fee={}, change={} (change_idx={:?}, producer_idx={})",
+        amount, recipient, fee, dal_fee, change, resp.change_index, resp.producer_index
     );
     if change > 0 {
         println!("Run 'scan' to pick up change note.");
@@ -5752,23 +6275,30 @@ fn cmd_unshield(
 fn cmd_shield_rollup(
     path: &str,
     profile: &WalletNetworkProfile,
-    sender: &str,
+    deposit_id_arg: Option<&str>,
     amount: u64,
+    fee: Option<u64>,
     to: Option<String>,
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
     let rollup = RollupRpc::new(profile);
-    let balances = rollup.load_balances()?;
-    let public_balance = balances.get(sender).copied().unwrap_or(0);
-    if public_balance < amount {
-        return Err(format!(
-            "insufficient public rollup balance for {}: have {}, need {}",
-            sender, public_balance, amount
-        ));
-    }
+    let head_hash = rollup.head_hash()?;
+    let fee = resolve_requested_tx_fee(fee, rollup.current_required_tx_fee_at_block(&head_hash)?)?;
+    ensure_positive_dal_fee(profile.dal_fee)?;
+    let balances = rollup.load_balances_at_block(&head_hash)?;
+    let producer_address = &profile.dal_fee_address;
+    let total_debit = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(profile.dal_fee))
+        .ok_or_else(|| "shield total spend overflow".to_string())?;
 
     let mut w = load_wallet(path)?;
+    let requested_deposit_id = deposit_id_arg.map(parse_deposit_id_hex).transpose()?;
+    let (selected_deposit, public_balance) =
+        select_pending_deposit(&w, &balances, requested_deposit_id, total_debit)?;
+    let deposit_id = selected_deposit.deposit_id;
+    let deposit_secret = selected_deposit.secret;
     let (address, generated_self_address) = if let Some(addr_path) = to {
         (load_address(&addr_path)?, false)
     } else {
@@ -5776,43 +6306,43 @@ fn cmd_shield_rollup(
         (addr, true)
     };
 
-    let rseed = random_felt();
-    let rcm = derive_rcm(&rseed);
-    let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
-    let cm = commit(&address.d_j, amount, &rcm, &otag);
-    let sender_f = hash(sender.as_bytes());
-    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
-    )
-    .map_err(|_| "invalid ek_v")?;
-    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
-    )
-    .map_err(|_| "invalid ek_d")?;
-    let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
-    let enc = encrypt_note(amount, &rseed, memo_bytes, &ek_v_recv, &ek_d_recv);
-    let memo_ct_hash_f = memo_ct_hash(&enc);
+    let client_note = build_output_note(&address, amount, memo.as_deref().map(str::as_bytes))?;
+    let producer_note = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
     let args: Vec<String> = vec![
-        felt_u64_to_hex(9),
+        felt_u64_to_hex(19),
         felt_u64_to_hex(amount),
-        felt_to_hex(&cm),
-        felt_to_hex(&sender_f),
-        felt_to_hex(&memo_ct_hash_f),
+        felt_u64_to_hex(fee),
+        felt_u64_to_hex(profile.dal_fee),
+        felt_to_hex(&client_note.cm),
+        felt_to_hex(&producer_note.cm),
+        felt_to_hex(&deposit_id),
+        felt_to_hex(&client_note.mh),
+        felt_to_hex(&producer_note.mh),
+        felt_to_hex(&deposit_secret),
         felt_to_hex(&address.auth_root),
         felt_to_hex(&address.auth_pub_seed),
         felt_to_hex(&address.nk_tag),
         felt_to_hex(&address.d_j),
-        felt_to_hex(&rseed),
+        felt_to_hex(&client_note.rseed),
+        felt_to_hex(&producer_address.auth_root),
+        felt_to_hex(&producer_address.auth_pub_seed),
+        felt_to_hex(&producer_address.nk_tag),
+        felt_to_hex(&producer_address.d_j),
+        felt_to_hex(&producer_note.rseed),
     ];
     let proof = pc.make_proof("run_shield", &args)?;
     let req = ShieldReq {
-        sender: sender.into(),
+        deposit_id,
+        fee,
+        producer_fee: profile.dal_fee,
         v: amount,
         address,
         memo,
         proof,
-        client_cm: cm,
-        client_enc: Some(enc),
+        client_cm: client_note.cm,
+        client_enc: Some(client_note.enc),
+        producer_cm: producer_note.cm,
+        producer_enc: Some(producer_note.enc),
     };
 
     if generated_self_address {
@@ -5822,10 +6352,12 @@ fn cmd_shield_rollup(
     let kernel_req = shield_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
     println!(
-        "Submitted shield of {} from {} into note {}",
+        "Submitted shield of {} from deposit {} into note {} (fee {}, deposit balance before {})",
         amount,
-        sender,
-        short(&req.client_cm)
+        deposit_id_hex(&deposit_id),
+        short(&req.client_cm),
+        fee,
+        public_balance
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -5837,62 +6369,39 @@ fn cmd_transfer_rollup(
     profile: &WalletNetworkProfile,
     to_path: &str,
     amount: u64,
+    fee: Option<u64>,
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
     let rollup = RollupRpc::new(profile);
     let snapshot = rollup.load_state_snapshot()?;
+    let fee = resolve_requested_tx_fee(fee, snapshot.required_tx_fee)?;
+    ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
 
     let mut w = load_wallet(path)?;
     let recipient = load_address(to_path)?;
-    let selected = w.select_notes(amount)?;
+    let producer_address = &profile.dal_fee_address;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(profile.dal_fee))
+        .ok_or_else(|| "transfer total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - profile.dal_fee as u128) as u64;
 
     let nullifiers: Vec<F> = selected
         .iter()
         .map(|&i| note_nullifier(&w.notes[i]))
         .collect();
 
-    let rseed_1 = random_felt();
-    let rcm_1 = derive_rcm(&rseed_1);
-    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_v
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_v")?,
-    )
-    .map_err(|_| "invalid ek_v")?;
-    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_d
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_d")?,
-    )
-    .map_err(|_| "invalid ek_d")?;
-    let otag_1 = owner_tag(
-        &recipient.auth_root,
-        &recipient.auth_pub_seed,
-        &recipient.nk_tag,
-    );
-    let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
-    let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
-    let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
+    let note_1 = build_output_note(&recipient, amount, memo.as_deref().map(str::as_bytes))?;
 
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-    let rseed_2 = random_felt();
-    let rcm_2 = derive_rcm(&rseed_2);
-    let otag_2 = owner_tag(
-        &change_state.auth_root,
-        &change_state.auth_pub_seed,
-        &change_state.nk_tag,
-    );
-    let cm_2 = commit(&change_state.d_j, change, &rcm_2, &otag_2);
-    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
+    let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+    let note_2 = build_output_note(&change_address, change, None)?;
+    let note_3 = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
 
     let proof = {
         let auth_domain = snapshot.auth_domain;
@@ -5903,10 +6412,18 @@ fn cmd_transfer_rollup(
         let mut wots_sigs: Vec<Vec<F>> = vec![];
 
         let nfs_for_sh = nullifiers.clone();
-        let mh_1 = memo_ct_hash(&enc_1);
-        let mh_2 = memo_ct_hash(&enc_2);
-        let sighash =
-            transfer_sighash(&auth_domain, &root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
+        let sighash = transfer_sighash(
+            &auth_domain,
+            &root,
+            &nfs_for_sh,
+            fee,
+            &note_1.cm,
+            &note_2.cm,
+            &note_3.cm,
+            &note_1.mh,
+            &note_2.mh,
+            &note_3.mh,
+        );
 
         let mut wots_key_indices: Vec<u32> = vec![];
         let mut auth_pub_seeds: Vec<F> = vec![];
@@ -5939,11 +6456,12 @@ fn cmd_transfer_rollup(
             wots_key_indices.push(key_idx);
         }
 
-        let total_fields = 3 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 16;
+        let total_fields = 4 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 24;
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
+        args.push(felt_u64_to_hex(fee));
 
         for (idx, &si) in selected.iter().enumerate() {
             let note = &w.notes[si];
@@ -5974,23 +6492,32 @@ fn cmd_transfer_rollup(
             }
         }
 
-        args.push(felt_to_hex(&cm_1));
+        args.push(felt_to_hex(&note_1.cm));
         args.push(felt_to_hex(&recipient.d_j));
         args.push(felt_u64_to_hex(amount));
-        args.push(felt_to_hex(&rseed_1));
+        args.push(felt_to_hex(&note_1.rseed));
         args.push(felt_to_hex(&recipient.auth_root));
         args.push(felt_to_hex(&recipient.auth_pub_seed));
         args.push(felt_to_hex(&recipient.nk_tag));
-        args.push(felt_to_hex(&memo_ct_hash(&enc_1)));
+        args.push(felt_to_hex(&note_1.mh));
 
-        args.push(felt_to_hex(&cm_2));
+        args.push(felt_to_hex(&note_2.cm));
         args.push(felt_to_hex(&change_state.d_j));
         args.push(felt_u64_to_hex(change));
-        args.push(felt_to_hex(&rseed_2));
+        args.push(felt_to_hex(&note_2.rseed));
         args.push(felt_to_hex(&change_state.auth_root));
         args.push(felt_to_hex(&change_state.auth_pub_seed));
         args.push(felt_to_hex(&change_state.nk_tag));
-        args.push(felt_to_hex(&memo_ct_hash(&enc_2)));
+        args.push(felt_to_hex(&note_2.mh));
+
+        args.push(felt_to_hex(&note_3.cm));
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_u64_to_hex(profile.dal_fee));
+        args.push(felt_to_hex(&note_3.rseed));
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&note_3.mh));
 
         persist_wallet_and_make_proof(path, &w, pc, "run_transfer", &args)?
     };
@@ -5999,10 +6526,13 @@ fn cmd_transfer_rollup(
     let req = TransferReq {
         root,
         nullifiers: nullifiers.clone(),
-        cm_1,
-        cm_2,
-        enc_1,
-        enc_2,
+        fee,
+        cm_1: note_1.cm,
+        cm_2: note_2.cm,
+        cm_3: note_3.cm,
+        enc_1: note_1.enc,
+        enc_2: note_2.enc,
+        enc_3: note_3.enc,
         proof,
     };
     let kernel_req = transfer_req_to_kernel(&req)?;
@@ -6014,7 +6544,10 @@ fn cmd_transfer_rollup(
     );
     save_wallet(path, &w)?;
 
-    println!("Submitted transfer of {} with change {}", amount, change);
+    println!(
+        "Submitted transfer of {} with fee {} + dal fee {} and change {}",
+        amount, fee, profile.dal_fee, change
+    );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
     Ok(())
@@ -6024,17 +6557,25 @@ fn cmd_unshield_rollup(
     path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
+    fee: Option<u64>,
     recipient: &str,
     pc: &ProveConfig,
 ) -> Result<(), String> {
     let rollup = RollupRpc::new(profile);
     let snapshot = rollup.load_state_snapshot()?;
+    let fee = resolve_requested_tx_fee(fee, snapshot.required_tx_fee)?;
+    ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
 
     let mut w = load_wallet(path)?;
-    let selected = w.select_notes(amount)?;
+    let producer_address = &profile.dal_fee_address;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(profile.dal_fee))
+        .ok_or_else(|| "unshield total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - profile.dal_fee as u128) as u64;
 
     let nullifiers: Vec<F> = selected
         .iter()
@@ -6044,28 +6585,21 @@ fn cmd_unshield_rollup(
     let (cm_change, enc_change, change_data) = if change > 0 {
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-        let rseed_c = random_felt();
-        let rcm_c = derive_rcm(&rseed_c);
-        let otag_c = owner_tag(
-            &change_state.auth_root,
-            &change_state.auth_pub_seed,
-            &change_state.nk_tag,
-        );
-        let cm = commit(&change_state.d_j, change, &rcm_c, &otag_c);
-        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
-        let mh = memo_ct_hash(&enc);
+        let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+        let note = build_output_note(&change_address, change, None)?;
         let cd = ChangeData {
             d_j: change_state.d_j,
-            rseed: rseed_c,
+            rseed: note.rseed,
             auth_root: change_state.auth_root,
             auth_pub_seed: change_state.auth_pub_seed,
             nk_tag: change_state.nk_tag,
-            mh,
+            mh: note.mh,
         };
-        (cm, Some(enc), Some(cd))
+        (note.cm, Some(note.enc), Some(cd))
     } else {
         (ZERO, None, None)
     };
+    let producer_note = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
 
     let proof = {
         let auth_domain = snapshot.auth_domain;
@@ -6084,9 +6618,12 @@ fn cmd_unshield_rollup(
             &root,
             &nullifiers,
             amount,
+            fee,
             &recipient_f,
             &cm_change,
             &mh_change_f,
+            &producer_note.cm,
+            &producer_note.mh,
         );
 
         let mut wots_key_indices: Vec<u32> = vec![];
@@ -6119,12 +6656,13 @@ fn cmd_unshield_rollup(
             wots_key_indices.push(key_idx);
         }
 
-        let total = 5 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 8;
+        let total = 6 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 15;
         args.push(felt_u64_to_hex(total as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
         args.push(felt_u64_to_hex(amount));
+        args.push(felt_u64_to_hex(fee));
         args.push(felt_to_hex(&recipient_f));
 
         for (idx, &si) in selected.iter().enumerate() {
@@ -6171,6 +6709,14 @@ fn cmd_unshield_rollup(
             }
         }
 
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_u64_to_hex(profile.dal_fee));
+        args.push(felt_to_hex(&producer_note.rseed));
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&producer_note.mh));
+
         persist_wallet_and_make_proof(path, &w, pc, "run_unshield", &args)?
     };
 
@@ -6179,9 +6725,12 @@ fn cmd_unshield_rollup(
         root,
         nullifiers: nullifiers.clone(),
         v_pub: amount,
+        fee,
         recipient: recipient.into(),
         cm_change,
         enc_change,
+        cm_fee: producer_note.cm,
+        enc_fee: producer_note.enc,
         proof,
     };
     let kernel_req = unshield_req_to_kernel(&req)?;
@@ -6194,8 +6743,8 @@ fn cmd_unshield_rollup(
     save_wallet(path, &w)?;
 
     println!(
-        "Submitted unshield of {} into public account {}",
-        amount, recipient
+        "Submitted unshield of {} into public account {} with fee {} + dal fee {}",
+        amount, recipient, fee, profile.dal_fee
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -6259,11 +6808,18 @@ fn prepare_transfer_skip_proof(
     root: F,
     recipient: &PaymentAddress,
     amount: u64,
+    fee: u64,
+    dal_fee: u64,
+    producer_address: &PaymentAddress,
     memo: Option<&str>,
 ) -> Result<PreparedTransferSubmit, String> {
-    let selected = w.select_notes(amount)?;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(dal_fee))
+        .ok_or_else(|| "transfer total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - dal_fee as u128) as u64;
     let nullifiers: Vec<F> = selected
         .iter()
         .map(|&i| {
@@ -6272,44 +6828,13 @@ fn prepare_transfer_skip_proof(
         })
         .collect();
 
-    let rseed_1 = random_felt();
-    let rcm_1 = derive_rcm(&rseed_1);
-    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_v
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_v")?,
-    )
-    .map_err(|_| "invalid ek_v")?;
-    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_d
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_d")?,
-    )
-    .map_err(|_| "invalid ek_d")?;
-    let otag_1 = owner_tag(
-        &recipient.auth_root,
-        &recipient.auth_pub_seed,
-        &recipient.nk_tag,
-    );
-    let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
-    let memo_bytes = memo.map(str::as_bytes);
-    let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
+    let note_1 = build_output_note(recipient, amount, memo.map(str::as_bytes))?;
 
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-    let rseed_2 = random_felt();
-    let rcm_2 = derive_rcm(&rseed_2);
-    let otag_2 = owner_tag(
-        &change_state.auth_root,
-        &change_state.auth_pub_seed,
-        &change_state.nk_tag,
-    );
-    let cm_2 = commit(&change_state.d_j, change, &rcm_2, &otag_2);
-    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
+    let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+    let note_2 = build_output_note(&change_address, change, None)?;
+    let note_3 = build_output_note(producer_address, dal_fee, Some(b"dal"))?;
 
     Ok(PreparedTransferSubmit {
         selected,
@@ -6317,10 +6842,13 @@ fn prepare_transfer_skip_proof(
         req: TransferReq {
             root,
             nullifiers,
-            cm_1,
-            cm_2,
-            enc_1,
-            enc_2,
+            fee,
+            cm_1: note_1.cm,
+            cm_2: note_2.cm,
+            cm_3: note_3.cm,
+            enc_1: note_1.enc,
+            enc_2: note_2.enc,
+            enc_3: note_3.enc,
             proof: Proof::TrustMeBro,
         },
     })
@@ -6330,11 +6858,18 @@ fn prepare_unshield_skip_proof(
     w: &mut WalletFile,
     root: F,
     amount: u64,
+    fee: u64,
+    dal_fee: u64,
+    producer_address: &PaymentAddress,
     recipient: &str,
 ) -> Result<PreparedUnshieldSubmit, String> {
-    let selected = w.select_notes(amount)?;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(dal_fee))
+        .ok_or_else(|| "unshield total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - dal_fee as u128) as u64;
     let nullifiers: Vec<F> = selected
         .iter()
         .map(|&i| {
@@ -6346,28 +6881,21 @@ fn prepare_unshield_skip_proof(
     let (cm_change, enc_change, _change_data) = if change > 0 {
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-        let rseed_c = random_felt();
-        let rcm_c = derive_rcm(&rseed_c);
-        let otag_c = owner_tag(
-            &change_state.auth_root,
-            &change_state.auth_pub_seed,
-            &change_state.nk_tag,
-        );
-        let cm = commit(&change_state.d_j, change, &rcm_c, &otag_c);
-        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
-        let mh = memo_ct_hash(&enc);
+        let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+        let note = build_output_note(&change_address, change, None)?;
         let cd = ChangeData {
             d_j: change_state.d_j,
-            rseed: rseed_c,
+            rseed: note.rseed,
             auth_root: change_state.auth_root,
             auth_pub_seed: change_state.auth_pub_seed,
             nk_tag: change_state.nk_tag,
-            mh,
+            mh: note.mh,
         };
-        (cm, Some(enc), Some(cd))
+        (note.cm, Some(note.enc), Some(cd))
     } else {
         (ZERO, None, None)
     };
+    let producer_note = build_output_note(producer_address, dal_fee, Some(b"dal"))?;
 
     Ok(PreparedUnshieldSubmit {
         selected,
@@ -6376,9 +6904,12 @@ fn prepare_unshield_skip_proof(
             root,
             nullifiers,
             v_pub: amount,
+            fee,
             recipient: recipient.into(),
             cm_change,
             enc_change,
+            cm_fee: producer_note.cm,
+            enc_fee: producer_note.enc,
             proof: Proof::TrustMeBro,
         },
     })
@@ -6398,12 +6929,18 @@ fn finalize_successful_spend(
 }
 
 fn cmd_fund(ledger: &str, addr: &str, amount: u64) -> Result<(), String> {
+    let deposit_id = deposit_id_from_label(addr);
     let req = FundReq {
-        recipient: addr.into(),
+        recipient: deposit_balance_key(&deposit_id),
         amount,
     };
     let _: serde_json::Value = post_json(&format!("{}/fund", ledger), &req)?;
-    println!("Funded {} with {}", addr, amount);
+    println!(
+        "Funded deposit {} ({}) with {}",
+        felt_to_hex(&deposit_id),
+        addr,
+        amount
+    );
     Ok(())
 }
 
@@ -6411,6 +6948,11 @@ fn cmd_fund(ledger: &str, addr: &str, amount: u64) -> Result<(), String> {
 mod network_profile_tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn sample_dal_fee_address() -> PaymentAddress {
+        let wallet = super::tests::test_wallet(1);
+        super::tests::payment_address_for_wallet_address(&wallet, 0)
+    }
 
     #[test]
     fn network_profile_roundtrip_persists_shadownet_settings() {
@@ -6421,6 +6963,8 @@ mod network_profile_tests {
             "https://rollup.shadownet.example".into(),
             "sr1ExampleRollup".into(),
             "KT1ExampleTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             Some("https://operator.shadownet.example".into()),
             Some("operator-secret".into()),
             "alice".into(),
@@ -6447,6 +6991,8 @@ mod network_profile_tests {
             "https://saved-rollup.example".into(),
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             None,
             None,
             "bootstrap1".into(),
@@ -6472,6 +7018,8 @@ mod network_profile_tests {
             "https://saved-rollup.example".into(),
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             Some("https://operator.shadownet.example".into()),
             None,
             "bootstrap1".into(),
@@ -6498,6 +7046,8 @@ mod network_profile_tests {
             "rollup_node_url": "https://saved-rollup.example",
             "rollup_address": "sr1SavedRollup",
             "bridge_ticketer": "KT1SavedTicketer",
+            "dal_fee": 1,
+            "dal_fee_address": sample_dal_fee_address(),
             "operator_url": "https://operator.shadownet.example",
             "source_alias": "bootstrap1",
             "public_account": "bootstrap1",
@@ -6515,11 +7065,85 @@ mod network_profile_tests {
     }
 
     #[test]
+    fn rollup_rpc_load_balances_preserves_raw_json_deposit_balance_key() {
+        let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+        let amount = 123u64;
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_BALANCE_COUNT
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", deposit_key)),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    balance_durable_key(&deposit_key)
+                ),
+                (200, format!("\"{}\"", hex::encode(amount.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        let balances = RollupRpc::new(&profile).load_balances().unwrap();
+
+        assert_eq!(balances.get(&deposit_key), Some(&amount));
+    }
+
+    #[test]
+    fn bridge_deposit_persists_secret_before_l1_submission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        save_wallet(wallet_path_str, &super::tests::test_wallet(1)).expect("save wallet");
+
+        let octez_client = dir.path().join("fake-octez-client.sh");
+        let wallet_path_quoted = wallet_path_str.replace('\'', "'\\''");
+        std::fs::write(
+            &octez_client,
+            format!(
+                "#!/bin/sh\nif ! grep -q '\"deposit_id\"' '{}'; then\n  echo missing deposit secret >&2\n  exit 42\nfi\necho 'Operation hash is ooPersistedDepositSecret'\n",
+                wallet_path_quoted
+            ),
+        )
+        .expect("write fake octez-client");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&octez_client, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake octez-client");
+        }
+
+        let mut profile = super::tests::rollup_profile_for_url("http://127.0.0.1:9");
+        profile.octez_client_bin = octez_client.to_str().unwrap().into();
+
+        cmd_bridge_deposit(wallet_path_str, &profile, 123).expect("deposit command");
+
+        let wallet = load_wallet(wallet_path_str).expect("load wallet");
+        assert_eq!(wallet.pending_deposits.len(), 1);
+        assert_eq!(wallet.pending_deposits[0].amount, 123);
+        assert_eq!(
+            wallet.pending_deposits[0].operation_hash.as_deref(),
+            Some("ooPersistedDepositSecret")
+        );
+    }
+
+    #[test]
     fn display_network_profile_redacts_operator_bearer_token() {
         let profile = shadownet_profile(
             "https://saved-rollup.example".into(),
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             Some("https://operator.shadownet.example".into()),
             Some("operator-secret".into()),
             "bootstrap1".into(),
@@ -6547,6 +7171,8 @@ mod network_profile_tests {
             "https://saved-rollup.example".into(),
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             Some("https://operator.shadownet.example".into()),
             Some("operator-secret".into()),
             "bootstrap1".into(),
@@ -6698,6 +7324,764 @@ mod network_profile_tests {
             .load_notes_since(0)
             .expect_err("oversized note length should fail");
         assert!(err.contains("exceeds max supported size"));
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_resets_after_idle_level() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLmockhead\"".into()),
+            ),
+            ("/global/block/BLmockhead/level".into(), (200, "11".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(3u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_quotes_next_inbox_level_not_congested_head() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLmockhead\"".into()),
+            ),
+            ("/global/block/BLmockhead/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_uses_pinned_head_next_level_congestion() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLmockhead\"".into()),
+            ),
+            ("/global/block/BLmockhead/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(3u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(
+            rollup.current_required_tx_fee().unwrap(),
+            required_tx_fee_for_private_tx_count(3)
+        );
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_ignores_mismatched_fee_metadata() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLmockhead\"".into()),
+            ),
+            ("/global/block/BLmockhead/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_does_not_require_tree_routes() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLmockhead\"".into()),
+            ),
+            ("/global/block/BLmockhead/level".into(), (200, "12".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_pins_reads_to_one_head_hash() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLstable\"".into()),
+            ),
+            ("/global/block/BLstable/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            ("/global/block/head/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn cmd_shield_rollup_pins_fee_and_balance_reads_to_same_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let mut wallet = super::tests::test_wallet(1);
+        let sender = "alice";
+        let deposit_secret = deposit_secret_from_label(sender);
+        let deposit_id = deposit_id_from_secret(&deposit_secret);
+        let deposit_key = deposit_balance_key(&deposit_id);
+        wallet.pending_deposits.push(PendingDeposit {
+            deposit_id,
+            secret: deposit_secret,
+            amount: 0,
+            operation_hash: None,
+        });
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+        let recipient_path = dir.path().join("recipient.json");
+        let recipient = super::tests::payment_address_for_wallet_address(&wallet, 0);
+        std::fs::write(
+            &recipient_path,
+            serde_json::to_vec(&recipient).expect("serialize recipient"),
+        )
+        .expect("write recipient");
+
+        let amount = 10u64;
+        let old_head_balance = amount + MIN_TX_FEE;
+        let new_head_balance = old_head_balance + 1;
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLoldhead\"".into()),
+            ),
+            ("/global/block/BLoldhead/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLoldhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLoldhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLoldhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLoldhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_BALANCE_COUNT
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLoldhead/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(deposit_key.as_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLoldhead/durable/wasm_2_0_0/value?key={}",
+                    balance_durable_key(&deposit_key)
+                ),
+                (
+                    200,
+                    format!("\"{}\"", hex::encode(old_head_balance.to_le_bytes())),
+                ),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_BALANCE_COUNT
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(deposit_key.as_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    balance_durable_key(&deposit_key)
+                ),
+                (
+                    200,
+                    format!("\"{}\"", hex::encode(new_head_balance.to_le_bytes())),
+                ),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let pc = ProveConfig {
+            skip_proof: false,
+            reprove_bin: "/definitely/missing/reprove".into(),
+            executables_dir: "cairo/target/dev".into(),
+        };
+
+        let err = cmd_shield_rollup(
+            wallet_path_str,
+            &profile,
+            None,
+            amount,
+            None,
+            Some(recipient_path.to_str().unwrap().into()),
+            None,
+            &pc,
+        )
+        .expect_err("shield should reject a mixed-head fee/balance snapshot");
+        assert!(
+            err.contains("no tracked secret-bound deposit has enough rollup balance"),
+            "expected insufficient deposit balance from pinned reads, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cmd_wallet_check_fails_when_full_snapshot_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let wallet = super::tests::test_wallet(1);
+        let note =
+            super::tests::note_memo_for_wallet_address(&wallet, 0, 91, felt_tag(b"check"), None);
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "12".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(2u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                "/global/block/BLmockhead/durable/wasm_2_0_0/value?key=/tzel/v1/state/balances/count"
+                    .into(),
+                (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, "1".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 1)
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_note_len_key(1)
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+        ]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        let err = cmd_wallet_check(wallet_path_str, &profile)
+            .expect_err("wallet check should fail when the rollup snapshot is incomplete");
+        assert!(
+            err.contains("missing note 1"),
+            "expected missing note error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cmd_wallet_check_succeeds_with_consistent_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let wallet = super::tests::test_wallet(1);
+        let note =
+            super::tests::note_memo_for_wallet_address(&wallet, 0, 91, felt_tag(b"check-ok"), None);
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+        let root = MerkleTree::from_leaves(vec![note.cm]).root();
+
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "12".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(root))),
+            ),
+            (
+                "/global/block/BLmockhead/durable/wasm_2_0_0/value?key=/tzel/v1/state/balances/count"
+                    .into(),
+                (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, encoded.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+        ]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        cmd_wallet_check(wallet_path_str, &profile).expect("wallet check should succeed");
+    }
+
+    #[test]
+    fn cmd_wallet_check_fails_on_tree_root_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let wallet = super::tests::test_wallet(1);
+        let note =
+            super::tests::note_memo_for_wallet_address(&wallet, 0, 52, felt_tag(b"root"), None);
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "12".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                "/global/block/BLmockhead/durable/wasm_2_0_0/value?key=/tzel/v1/state/balances/count"
+                    .into(),
+                (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, encoded.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+        ]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        let err = cmd_wallet_check(wallet_path_str, &profile)
+            .expect_err("wallet check should fail on tree root mismatch");
+        assert!(
+            err.contains("tree root mismatch"),
+            "expected tree root mismatch error, got: {err}"
+        );
     }
 
     #[test]

@@ -17,9 +17,9 @@ The kernel consumes Tezos Data Encoding inbox messages and records:
 
 Supported message kinds:
 - `deposit` (bridge-balance credit after an L1 deposit is observed)
-- `shield` (convert credited bridge balance into a shielded note)
-- `transfer` (shielded transfer inside the rollup)
-- `unshield` (consume a shielded note and credit transparent rollup balance)
+- `shield` (convert credited bridge balance into a user note plus a DAL-producer fee note, and burn the protocol fee)
+- `transfer` (shielded transfer inside the rollup, creating recipient, change, and DAL-producer fee notes while burning the protocol fee)
+- `unshield` (consume a shielded note, burn the protocol fee, credit transparent rollup balance, and append the DAL-producer fee note plus optional change)
 - `withdraw` (debit transparent rollup balance and emit an L1 outbox withdrawal payload)
 
 These messages are applied through the shared Rust transition logic in `core/`.
@@ -32,6 +32,16 @@ The kernel does not keep the full ledger as one serialized blob. It stores:
 - per-account bridge balances used for deposit/withdrawal accounting
 - queued withdrawals under append-only per-index paths
 
+The current POC kernel uses a simple congestion fee policy for private
+transactions:
+
+- floor: `100000` mutez
+- first two accepted private transactions per inbox level pay that floor
+- each additional accepted private transaction at that same level doubles the
+  required burn fee
+- the doubling schedule is capped after 6 steps
+- when the inbox level advances, the required fee resets to the floor
+
 Durable storage paths:
 - `/tzel/v1/stats/raw_input_count`
 - `/tzel/v1/stats/raw_input_bytes`
@@ -39,6 +49,7 @@ Durable storage paths:
 - `/tzel/v1/state/last_input_id`
 - `/tzel/v1/state/last_input_len`
 - `/tzel/v1/state/last_input_payload`
+- `/tzel/v1/state/fees/*`
 - `/tzel/v1/state/auth_domain`
 - `/tzel/v1/state/tree/*`
 - `/tzel/v1/state/notes/*`
@@ -94,8 +105,9 @@ TZEL_RUN_OCTEZ_ROLLUP_SANDBOX_DAL=1 \
 
 The DAL smoke requires `octez-dal-node` in addition to the normal sandbox
 dependencies. It spins up a local node, baker, DAL node, rollup node, and
-`tzel-operator`, then submits the checked-in verified shield fixture through the
-operator and waits for the rollup durable state to reflect the shield.
+publishes both the signed config messages and the checked-in verified shield
+fixture through DAL pointers, then waits for the rollup durable state to reflect
+the configuration and shield.
 
 You can then strip it and run it with the Octez smart-rollup debugger as
 described in the Tezos smart-rollup tutorial.
