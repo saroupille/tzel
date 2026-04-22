@@ -26,3 +26,22 @@ getrandom = { version = "0.2.17", features = ["custom"] }
 
 [dev-dependencies]
 ml-kem = "=0.3.0-rc.2"
+
+# ── PoC: canonical-binding-bypass end-to-end kernel integration test ──
+# These crates let the e2e test build and prove a STARK bundle directly,
+# mirroring the attacker pipeline demonstrated in
+# `verifier/tests/canonical_binding_bypass.rs`. The kernel then ingests
+# the forged bundle through its real inbox-message path
+# (`tests/e2e_verifier_binding_bypass.rs`). All versions match the
+# stwo / stwo-circuits pins already used by `verifier/Cargo.toml`.
+anyhow = "1"
+zstd = "0.13"
+starknet-types-core = { version = "=0.2.4", default-features = false, features = ["hash"] }
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", default-features = false }
+circuit-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775", features = ["prover"] }
+circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }

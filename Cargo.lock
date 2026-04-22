@@ -5476,15 +5476,26 @@ dependencies = [
 name = "tzel-rollup-kernel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "circuit-air",
+ "circuit-common",
+ "circuit-prover",
+ "circuit-serialize",
+ "circuits",
+ "circuits-stark-verifier",
  "getrandom 0.2.17",
  "hex",
  "ml-kem",
  "serde",
  "serde_json",
+ "starknet-types-core",
+ "stwo",
+ "stwo-constraint-framework",
  "tezos-smart-rollup-encoding",
  "tezos_data_encoding 0.5.2",
  "tzel-core",
  "tzel-verifier",
+ "zstd",
 ]
 
 [[package]]
