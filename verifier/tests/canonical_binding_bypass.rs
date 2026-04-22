@@ -34,9 +34,18 @@
 //! 3. Build a tiny custom circuit whose FIRST two `output` gates emit
 //!    exactly those two `QM31`s. (`finalize_context` appends two
 //!    additional hash-of-constants output gates, so the final
-//!    `claim.output_values` has length 4. Only the first 8 u32s of
-//!    `public_output_values` are cross-checked against the preimage
-//!    hash by `bundle.verify()`, so this is fine.)
+//!    `claim.output_values` has length 4.)
+//!
+//!    `ProofBundle::verify()` binds `public_output_values` in two ways:
+//!    (i)  the FIRST 8 u32s must equal `Blake(output_preimage)` — this
+//!         is the only "preimage binding" the verifier enforces;
+//!    (ii) ALL 16 u32s are compared against the circuit's
+//!         `claim.output_values` by `verify_circuit`
+//!         (see `verifier/src/bundle.rs:188-200`).
+//!    The attacker controls both sides of (ii) (it's their circuit),
+//!    so (ii) is vacuous. Only (i) is a real binding — and it binds to
+//!    whatever preimage the attacker hands in, because it is a digest
+//!    over attacker-supplied bytes, not a signature over canonical data.
 //! 4. Prove the circuit with the public stwo-circuits API
 //!    (`circuit_prover::prover::prove_circuit_assignment`).
 //! 5. Package the proof into a `ProofBundle` with a self-consistent
@@ -58,8 +67,18 @@
 //!     --test canonical_binding_bypass --release -- --nocapture
 //! ```
 //!
-//! Both tests print `[PoC] bundle.verify() -> Ok — canonical-binding
-//! bypass demonstrated` and exit 0.
+//! Both tests PASS. The assertion `bundle.verify().is_ok()` IS the
+//! canonical-binding-bypass signal — failure to pass would mean the
+//! verifier rejected an attacker-constructed bundle. Run with
+//! `-- --nocapture` to see the `[PoC] bundle.verify() -> Ok` banner
+//! and intermediate diagnostics on stderr.
+//!
+//! # Toolchain
+//!
+//! The `circuit-prover` dev-dep uses unstable features
+//! (`array_chunks_mut`). The `+nightly-2025-07-14` prefix is REQUIRED
+//! because this crate has no `rust-toolchain.toml` of its own (only
+//! `apps/prover/rust-toolchain.toml` pins it workspace-locally).
 
 use anyhow::Result;
 
@@ -69,10 +88,10 @@ use circuit_prover::prover::{
     prepare_circuit_proof_for_circuit_verifier, prove_circuit_assignment, BaseColumnPool,
     SimdBackend,
 };
-use circuit_serialize::serialize::CircuitSerialize;
+use circuit_serialize::serialize::CircuitSerialize as _;
 use circuits::blake::HashValue;
 use circuits::context::{Context, TraceContext};
-use circuits::ivalue::{qm31_from_u32s, IValue};
+use circuits::ivalue::{qm31_from_u32s, IValue as _};
 use circuits::ops::{guess, output};
 use circuits_stark_verifier::proof::ProofConfig;
 use circuits_stark_verifier::proof_from_stark_proof::pack_into_qm31s;
@@ -402,16 +421,12 @@ fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<(
         "prover must succeed on attacker context",
     );
 
-    // Sanity: the FIRST two output values match what we targeted.
-    //
-    // The stwo-circuits finalize pipeline (`finalize_context` inside
-    // `PreprocessedCircuit::preprocess_circuit`) appends two additional
-    // output gates for `HashValue` of the context's constants. So
-    // `claim.output_values` always has length `n_user_outputs + 2`. The
-    // bundle's `verify()` only cross-checks the FIRST 8 u32s (= 2 QM31s)
-    // of `verify_meta.public_output_values` against the preimage hash, so
-    // as long as our two user outputs sit at indices 0 and 1 of the
-    // claim, the rest can be whatever the circuit produces.
+    // Sanity: the FIRST two output values match what we targeted. The
+    // module-level doc explains why only indices 0 and 1 matter for the
+    // preimage binding; the remaining entries are attacker-consistent
+    // by construction (same circuit emits them and the VerifyMeta ships
+    // them). `finalize_context` appends two hash-of-constants output
+    // gates so the total is `n_user_outputs + 2 = 4`.
     assert_eq!(circuit_proof.claim.output_values.len(), 4);
     assert_eq!(circuit_proof.claim.output_values[0], target_output_qm31s[0]);
     assert_eq!(circuit_proof.claim.output_values[1], target_output_qm31s[1]);
@@ -499,12 +514,15 @@ fn assert_bundle_verify_accepts(attacker_chosen_preimage: Vec<Felt>) -> Result<(
 // ── Test 1: arbitrary preimage (shape-agnostic bypass) ─────────────────
 
 /// Minimum viable proof-of-concept: `ProofBundle::verify()` is shape-
-/// agnostic once the bundle is internally self-consistent. Here the
-/// `output_preimage` is 13 felts of arbitrary content (`0x1000..0x100c`).
+/// agnostic once the bundle is internally self-consistent. The
+/// `output_preimage` is 3 felts of arbitrary content (`0x1000..0x1002`)
+/// — deliberately NOT 13 (the transfer-shaped length tested below) to
+/// make it unambiguous that the verifier does not enforce any preimage
+/// shape of its own.
 #[test]
 fn proof_bundle_verify_accepts_bundle_from_attacker_pipeline() -> Result<()> {
     let attacker_chosen_preimage: Vec<Felt> =
-        (0u64..13).map(|i| Felt::from(0x1000_u64 + i)).collect();
+        (0u64..3).map(|i| Felt::from(0x1000_u64 + i)).collect();
     assert_bundle_verify_accepts(attacker_chosen_preimage)
 }
 

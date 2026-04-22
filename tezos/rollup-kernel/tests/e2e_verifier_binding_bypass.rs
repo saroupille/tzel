@@ -2,6 +2,14 @@
 //! whose STARK bundle was produced entirely outside tzel's canonical
 //! prover pipeline.
 //!
+//! # Toolchain
+//!
+//! The `circuit-prover` dev-dep requires unstable Rust features
+//! (`array_chunks_mut`). The `+nightly-2025-07-14` prefix is REQUIRED on
+//! all `cargo` invocations below because this crate has no local
+//! `rust-toolchain.toml` (only `apps/prover/rust-toolchain.toml` pins
+//! that channel and it is not inherited here).
+//!
 //! # What this test demonstrates
 //!
 //! Phase 2-4 of this disclosure showed that `tzel_verifier::ProofBundle::verify()`
@@ -72,12 +80,16 @@
 //!     --test e2e_verifier_binding_bypass --release -- --nocapture
 //! ```
 
+// Note: this test is gated on `feature = "proof-verifier"` (enabled by
+// default in `tezos/rollup-kernel/Cargo.toml`). Running with
+// `--no-default-features` compiles it to empty and reports `0 passed` —
+// that is a silent pass, not a confirmed bypass. Always run with the
+// default features enabled.
 #![cfg(feature = "proof-verifier")]
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 
-use anyhow::Result;
 use serde::Deserialize;
 use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{
@@ -101,10 +113,10 @@ use circuit_prover::prover::{
     prepare_circuit_proof_for_circuit_verifier, prove_circuit_assignment, BaseColumnPool,
     SimdBackend,
 };
-use circuit_serialize::serialize::CircuitSerialize;
+use circuit_serialize::serialize::CircuitSerialize as _;
 use circuits::blake::HashValue;
 use circuits::context::{Context, TraceContext};
-use circuits::ivalue::{qm31_from_u32s, IValue};
+use circuits::ivalue::{qm31_from_u32s, IValue as _};
 use circuits::ops::{guess, output};
 use circuits_stark_verifier::proof::ProofConfig;
 use circuits_stark_verifier::proof_from_stark_proof::pack_into_qm31s;
